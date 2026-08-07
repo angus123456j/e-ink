@@ -74,17 +74,32 @@ LAND_URL = "https://raw.githubusercontent.com/nvkelso/natural-earth-vector/maste
 # data turns archipelagos into static that reads as noise rather than geography.
 MIN_ISLAND_AREA = 0.75
 
+# Map labels are set in Jost, not the serif used for display type.
+#
+# They were 7-10px Liberation Serif, and the ocean names were serif *italic* at
+# 8px, which measured as the least legible combination on this panel: at 0.20mm
+# per pixel a serif hairline is thinner than one pixel, so thresholding it to
+# pure black either drops the stroke or clogs it. Jost has near-even strokes and
+# survives both the size and the threshold. Land is set semibold and ocean
+# regular, which separates them now that italic is gone.
 REGULAR = "LiberationSerif-Regular.ttf"
 BOLD = "LiberationSerif-Bold.ttf"
 ITALIC = "LiberationSerif-Italic.ttf"
+
+INKY_FONT_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(PLUGIN_DIR)), "static", "fonts")
+SANS = os.path.join(INKY_FONT_DIR, "Jost.ttf")
+SANS_BOLD = os.path.join(INKY_FONT_DIR, "Jost-SemiBold.ttf")
 
 _font_cache = {}
 
 
 def font(name, size):
+    """Load a font by filename from the plugin's fonts dir, or by full path."""
     key = (name, size)
     if key not in _font_cache:
-        _font_cache[key] = ImageFont.truetype(os.path.join(FONT_DIR, name), size)
+        path = name if os.path.isabs(name) else os.path.join(FONT_DIR, name)
+        _font_cache[key] = ImageFont.truetype(path, size)
     return _font_cache[key]
 
 
@@ -183,26 +198,25 @@ def ring_area(ring):
 
 # Continents and countries, in black to match the coastlines.
 LAND_LABELS = [
-    ("CANADA", -101, 61, 8),
-    ("UNITED STATES", -99, 41, 8),
-    ("MEXICO", -103, 24, 7),
-    ("BRAZIL", -53, -10, 8),
-    ("EUROPE", 19, 51, 8),
-    ("AFRICA", 21, 3, 9),
-    ("ASIA", 95, 47, 10),
-    ("AUSTRALIA", 134, -25, 8),
-    ("ANTARCTICA", 20, -76, 8),
+    ("CANADA", -101, 61, 9),
+    ("UNITED STATES", -99, 41, 9),
+    ("BRAZIL", -53, -10, 9),
+    ("EUROPE", 19, 51, 9),
+    ("AFRICA", 21, 3, 10),
+    ("ASIA", 95, 47, 11),
+    ("AUSTRALIA", 134, -25, 9),
+    ("ANTARCTICA", 20, -76, 9),
 ]
 
 # Ocean names in italic. With everything in black, the italic is what
 # distinguishes water labels from the upright land labels.
 OCEAN_LABELS = [
-    ("NORTH PACIFIC OCEAN", -147, 26, 8),
-    ("SOUTH PACIFIC OCEAN", -125, -30, 8),
-    ("NORTH ATLANTIC OCEAN", -41, 19, 8),
-    ("SOUTH ATLANTIC OCEAN", -21, -36, 8),
-    ("INDIAN OCEAN", 80, -30, 8),
-    ("SOUTHERN OCEAN", -60, -62, 8),
+    ("NORTH PACIFIC OCEAN", -147, 26, 9),
+    ("SOUTH PACIFIC OCEAN", -125, -30, 9),
+    ("NORTH ATLANTIC OCEAN", -38, 26, 9),
+    ("SOUTH ATLANTIC OCEAN", -21, -36, 9),
+    ("INDIAN OCEAN", 80, -30, 9),
+    ("SOUTHERN OCEAN", -60, -62, 9),
 ]
 
 
@@ -250,11 +264,11 @@ def generate_world_map(out_path=None, quiet=False):
 
     for text, lon, lat, size in LAND_LABELS:
         x, y = projection.project(lon, lat, width, height)
-        letterspace(label_draw, (x, y), text, font(REGULAR, size), spacing=1.3)
+        letterspace(label_draw, (x, y), text, font(SANS_BOLD, size), spacing=1.1)
 
     for text, lon, lat, size in OCEAN_LABELS:
         x, y = projection.project(lon, lat, width, height)
-        letterspace(label_draw, (x, y), text, font(ITALIC, size), spacing=1.7)
+        letterspace(label_draw, (x, y), text, font(SANS, size), spacing=1.4)
 
     hard = label_mask.point(lambda value: 255 if value >= TEXT_THRESHOLD else 0)
     image.paste(Image.new("RGB", (width, height), BLACK), (0, 0), hard)

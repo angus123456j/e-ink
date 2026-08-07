@@ -30,6 +30,7 @@ from plugins.sharkmap.projection import (
     in_bounds,
     project,
 )
+from utils.app_utils import get_font
 from utils.http_client import get_http_session
 
 logger = logging.getLogger(__name__)
@@ -41,9 +42,21 @@ WORLD_MAP_PATH = os.path.join(PLUGIN_DIR, "world_map.png")
 FIN_PATH = os.path.join(PLUGIN_DIR, "fin.png")
 FONT_DIR = os.path.join(PLUGIN_DIR, "fonts")
 
+# Serif for display type, sans for anything small.
+#
+# Liberation Serif is a Times clone: at 8px its hairlines and serifs are thinner
+# than a pixel, so thresholding either drops them or clogs them and the line turns
+# to mush. Jost is a geometric sans with near-even strokes, which survives both
+# the small size and the threshold. Measured on the caption's own strings, 8px is
+# unusable in any face, 10px is marginal and 11px is comfortable -- so the small
+# lines moved up as well as across.
+#
+# Jost ships with InkyPi, so it is loaded through the framework's own get_font
+# rather than duplicated into this plugin.
 REGULAR = "LiberationSerif-Regular.ttf"
 BOLD = "LiberationSerif-Bold.ttf"
 ITALIC = "LiberationSerif-Italic.ttf"
+SANS = "Jost"
 
 # --- iNaturalist ----------------------------------------------------------
 INAT_OBSERVATIONS_URL = "https://api.inaturalist.org/v1/observations"
@@ -501,6 +514,11 @@ class SharkMap(BasePlugin):
     # ------------------------------------------------------------------
     # Fonts and text
     # ------------------------------------------------------------------
+    @staticmethod
+    def _sans(size, bold=True):
+        """Jost, from InkyPi's bundled fonts. Used for all small type."""
+        return get_font(SANS, max(7, int(size)), "bold" if bold else "normal")
+
     def _font(self, filename, size):
         """Load a bundled font.
 
@@ -608,14 +626,14 @@ class SharkMap(BasePlugin):
 
         # Sized to stack a title and a subtitle inside a 34px band without
         # either one touching the rule below or the top edge.
-        title_font = self._font(BOLD, 16 * scale)
-        sub_font = self._font(REGULAR, 8 * scale)
+        title_font = self._font(BOLD, 17 * scale)
+        sub_font = self._sans(9 * scale)
 
         self._letterspace(ink, (width / 2, header_height * 0.38),
                           "SHARK SIGHTINGS", title_font, spacing=2.6 * scale)
         self._letterspace(ink, (width / 2, header_height * 0.79),
                           "LIVE MARITIME OBSERVATIONS", sub_font,
-                          spacing=2.2 * scale)
+                          spacing=1.8 * scale)
 
         draw.line([(0, header_height - 1), (width, header_height - 1)],
                   fill=BLACK, width=1)
@@ -628,12 +646,12 @@ class SharkMap(BasePlugin):
 
         # The source credit iNaturalist's terms ask for, given the prominence a
         # decorative brand block would otherwise take.
-        credit_x = width - 150 * scale
+        credit_x = width - 158 * scale
         self._letterspace(ink, (credit_x, header_height * 0.36),
-                          "DATA: iNATURALIST", self._font(BOLD, 8 * scale),
-                          spacing=1.0 * scale, centre=False)
-        ink.text((credit_x, header_height * 0.66), "research-grade observations",
-                 self._font(ITALIC, 8.5 * scale))
+                          "DATA: iNATURALIST", self._sans(9 * scale),
+                          spacing=0.6 * scale, centre=False)
+        ink.text((credit_x, header_height * 0.68), "research-grade observations",
+                 self._sans(9 * scale, bold=False))
 
     def _draw_compass(self, draw, ink, cx, cy, radius, scale):
         """A flat compass rose: four cardinal spikes plus four minor ones."""
@@ -650,7 +668,7 @@ class SharkMap(BasePlugin):
                          fill=BLACK)
         # Sits clear above the northern spike rather than tucked against it.
         ink.text((cx, cy - radius - 6.5 * scale), "N",
-                 self._font(BOLD, 8 * scale), anchor="mm")
+                 self._sans(9 * scale), anchor="mm")
 
     @staticmethod
     def _bin_sightings(sightings, width, map_height, max_spots, separation,
@@ -780,8 +798,8 @@ class SharkMap(BasePlugin):
         divider = width * 0.375
 
         # --- left: what it is
-        name_font = self._font(BOLD, 11 * scale)
-        sci_font = self._font(ITALIC, 10 * scale)
+        name_font = self._font(BOLD, 13 * scale)
+        sci_font = self._font(ITALIC, 12 * scale)
         available = divider - margin - 12 * scale
 
         common = (self._species_name(sighting) if sighting else "No recent sightings")
@@ -803,22 +821,20 @@ class SharkMap(BasePlugin):
         text_x = divider + 34 * scale
         available = width - text_x - 12 * scale
 
-        # Sized to fit three lines inside a 42px strip without crowding.
-        line_font = self._font(REGULAR, 11 * scale)
-        detail_font = self._font(REGULAR, 8 * scale)
-        note_font = self._font(ITALIC, 8 * scale)
+        # Two lines rather than three. The old middle line said "Research grade"
+        # on every single refresh, since the query filters on it, so it earned no
+        # space; its one variable part, whether the location was obscured, is now
+        # folded into the note. Dropping it pays for type large enough to read.
+        line_font = self._font(REGULAR, 13 * scale)
+        note_font = self._sans(10 * scale, bold=False)
 
-        ink.text((text_x, top + strip_height * 0.26),
+        ink.text((text_x, top + strip_height * 0.32),
                  self._fit_text(ink, self._where_when(sighting), line_font, available),
                  line_font)
 
-        ink.text((text_x, top + strip_height * 0.56),
-                 self._fit_text(ink, self._provenance(sighting), detail_font, available),
-                 detail_font)
-
-        ink.text((text_x, top + strip_height * 0.82),
+        ink.text((text_x, top + strip_height * 0.72),
                  self._fit_text(ink, self._note_text(total_reported, lookback_days,
-                                                     stale_since),
+                                                     stale_since, sighting),
                                 note_font, available),
                  note_font)
 
@@ -866,21 +882,6 @@ class SharkMap(BasePlugin):
         return "  ·  ".join(parts) if parts else "Location not recorded"
 
     @staticmethod
-    def _provenance(sighting):
-        """How much the position can be trusted.
-
-        Every record we plot is research grade, because the query filters on it.
-        Coordinates are deliberately randomised by iNaturalist for threatened
-        species, so saying so is more honest than implying a precise fix.
-        """
-        parts = ["Research grade"]
-        if sighting and sighting.get("obscured"):
-            parts.append("location obscured by iNaturalist")
-        else:
-            parts.append("community-verified identification")
-        return "  ·  ".join(parts)
-
-    @staticmethod
     def _truncate(text, limit):
         """Shorten free text to `limit` characters, on a word break if possible."""
         if len(text) <= limit:
@@ -918,7 +919,7 @@ class SharkMap(BasePlugin):
         return format_date(date) if date else ""
 
     @staticmethod
-    def _note_text(total_reported, lookback_days, stale_since):
+    def _note_text(total_reported, lookback_days, stale_since, sighting=None):
         """The framing line.
 
         This is citizen-science data: it maps where people report sharks, not
@@ -928,6 +929,11 @@ class SharkMap(BasePlugin):
         plural = "sighting" if total_reported == 1 else "sightings"
         note = (f"Most recent of {total_reported} {plural} reported "
                 f"in the last {window}")
+
+        # Coordinates are deliberately randomised by iNaturalist for threatened
+        # species. Saying so is more honest than implying a precise fix.
+        if sighting and sighting.get("obscured"):
+            note += "  ·  location obscured"
 
         if stale_since:
             hours = int((datetime.now(timezone.utc) - stale_since).total_seconds() // 3600)
