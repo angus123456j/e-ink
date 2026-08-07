@@ -24,22 +24,25 @@ Canvas layout, top to bottom:
 CANVAS_WIDTH = 800
 CANVAS_HEIGHT = 480
 
-HEADER_HEIGHT = 48
+HEADER_HEIGHT = 34
 STRIP_HEIGHT = 42
 
 MAP_WIDTH = CANVAS_WIDTH
-MAP_HEIGHT = CANVAS_HEIGHT - HEADER_HEIGHT - STRIP_HEIGHT  # 390
+MAP_HEIGHT = CANVAS_HEIGHT - HEADER_HEIGHT - STRIP_HEIGHT  # 404
 MAP_TOP = HEADER_HEIGHT
 
 # Equirectangular bounds.
 #
-# The far north is still cropped -- nothing is reported from the high Arctic and
-# it is all ice -- but the south now reaches far enough to include the Antarctic
-# coastline, so the map reads as a complete world rather than one that stops
-# short. 162 degrees of latitude over 390 pixels is 2.41 px/degree against
-# 2.22 px/degree horizontally, so the projection is very close to square.
+# The far north stays cropped: nothing is reported from the high Arctic and it is
+# all ice. The south reaches past the Antarctic coastline so the map reads as a
+# complete world rather than one that stops short.
+#
+# The span is chosen to keep the projection near square rather than to fill the
+# frame. 167 degrees of latitude over 404 pixels is 2.42 px/degree against
+# 2.22 px/degree horizontally -- about 9% vertical stretch. Cropping tighter
+# would make the map taller but visibly distort the continents.
 LON_MIN, LON_MAX = -180.0, 180.0
-LAT_MIN, LAT_MAX = -82.0, 80.0
+LAT_MIN, LAT_MAX = -85.0, 82.0
 
 
 def project(lon, lat, width=MAP_WIDTH, height=MAP_HEIGHT):

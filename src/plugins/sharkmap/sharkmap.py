@@ -467,23 +467,25 @@ class SharkMap(BasePlugin):
         """Title block: name, subtitle, compass rose and the source credit."""
         draw.rectangle([0, 0, width, header_height], fill=WHITE)
 
-        title_font = self._font(BOLD, 22 * scale)
-        sub_font = self._font(REGULAR, 9 * scale)
+        # Sized to stack a title and a subtitle inside a 34px band without
+        # either one touching the rule below or the top edge.
+        title_font = self._font(BOLD, 16 * scale)
+        sub_font = self._font(REGULAR, 8 * scale)
 
-        self._letterspace(draw, (width / 2, header_height * 0.40),
-                          "SHARK SIGHTINGS", title_font, BLACK, spacing=3.0 * scale)
-        self._letterspace(draw, (width / 2, header_height * 0.75),
+        self._letterspace(draw, (width / 2, header_height * 0.38),
+                          "SHARK SIGHTINGS", title_font, BLACK, spacing=2.6 * scale)
+        self._letterspace(draw, (width / 2, header_height * 0.79),
                           "LIVE MARITIME OBSERVATIONS", sub_font, BLACK,
-                          spacing=2.4 * scale)
+                          spacing=2.2 * scale)
 
         draw.line([(0, header_height - 1), (width, header_height - 1)],
                   fill=BLACK, width=1)
 
-        # Smaller and nudged down from the earlier version: the rose plus its
-        # "N" needs to clear the top edge, and at radius 0.32 of the header the
-        # letter was being clipped.
-        self._draw_compass(draw, width * 0.055, header_height * 0.56,
-                           header_height * 0.24, scale)
+        # The rose plus its "N" has to fit inside a 34px band, so it is small and
+        # sits low: the letter goes above the northern spike, and at a larger
+        # radius it was being clipped by the top edge.
+        self._draw_compass(draw, width * 0.055, header_height * 0.62,
+                           header_height * 0.22, scale)
 
         # The source credit iNaturalist's terms ask for, given the prominence a
         # decorative brand block would otherwise take.
@@ -507,7 +509,8 @@ class SharkMap(BasePlugin):
             tip = (cx + dx * radius * 0.5, cy + dy * radius * 0.5)
             draw.polygon([tip, (cx, cy - radius * 0.13), (cx, cy + radius * 0.13)],
                          fill=BLACK)
-        draw.text((cx, cy - radius - 5 * scale), "N",
+        # Sits clear above the northern spike rather than tucked against it.
+        draw.text((cx, cy - radius - 6.5 * scale), "N",
                   font=self._font(BOLD, 8 * scale), fill=BLACK, anchor="mm")
 
     @staticmethod
