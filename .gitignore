@@ -178,3 +178,4 @@ src/plugins/sharkmap/tools/.cache/
 # Static Files added by install/update_vendors.sh
 /src/static/scripts/
 /src/static/styles/
+.localbin/
