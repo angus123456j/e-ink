@@ -9,9 +9,11 @@ It produces three files next to the plugin:
 
   world_map.png  the line-chart basemap: white ocean, black coastlines and
                  black place labels
-  fin.png        a shark-fin glyph whose *alpha channel* is the shape, so the
-                 plugin can recolour it at draw time
+  fin.png        the fin marker, derived from the supplied newfin.png artwork by
+                 filling its outline into a solid silhouette
   icon.png       the plugin icon for the InkyPi web UI
+
+newfin.png is hand-drawn source artwork and is never modified by this script.
 
 Two decisions worth knowing about.
 
@@ -38,6 +40,7 @@ import json
 import os
 import sys
 import urllib.request
+from collections import deque
 
 from PIL import Image, ImageDraw, ImageFont
 
@@ -48,6 +51,7 @@ sys.path.insert(0, PLUGIN_DIR)
 import projection  # noqa: E402  (needs the sys.path line above)
 
 CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache")
+FIN_ART_PATH = os.path.join(PLUGIN_DIR, "newfin.png")
 FONT_DIR = os.path.join(PLUGIN_DIR, "fonts")
 
 # --- Palette --------------------------------------------------------------
@@ -249,82 +253,77 @@ def generate_world_map(out_path=None, quiet=False):
 
 
 # --------------------------------------------------------------------------
-# Fin glyph
+# Fin marker, derived from the supplied artwork
 # --------------------------------------------------------------------------
 
-def quad_bezier(p0, p1, p2, steps=80):
-    """Sample a quadratic bezier curve; used to shape the fin's edges."""
-    points = []
-    for index in range(steps + 1):
-        t = index / steps
-        inv = 1.0 - t
-        points.append((
-            inv * inv * p0[0] + 2 * inv * t * p1[0] + t * t * p2[0],
-            inv * inv * p0[1] + 2 * inv * t * p1[1] + t * t * p2[1],
-        ))
-    return points
+def fill_enclosed(mask):
+    """Fill the interior of an outlined shape, returning a solid silhouette.
+
+    The supplied fin is line art. Drawn hollow at 13px its strokes fall below a
+    pixel and break up, and worse, a 1px outline carries exactly the same visual
+    weight as the coastlines, so the fins stop reading as markers and blend into
+    the map. Filling the interior keeps the artwork's shape and its waterline
+    while making it the only solid mass on the page, which is what lets it stay
+    legible when small.
+
+    Works by flooding the background inward from the border; anything the flood
+    cannot reach is enclosed, and gets filled.
+    """
+    binary = mask.point(lambda a: 255 if a >= 128 else 0)
+    width, height = binary.size
+
+    # Pad by a pixel so the flood always has an outside to start from, even
+    # where a stroke touches the edge of the artwork.
+    padded = Image.new("L", (width + 2, height + 2), 0)
+    padded.paste(binary, (1, 1))
+    pw, ph = padded.size
+    pixels = padded.load()
+
+    seen = bytearray(pw * ph)
+    queue = deque([(0, 0)])
+    seen[0] = 1
+    while queue:
+        x, y = queue.popleft()
+        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            nx, ny = x + dx, y + dy
+            if 0 <= nx < pw and 0 <= ny < ph and not seen[ny * pw + nx] \
+                    and not pixels[nx, ny]:
+                seen[ny * pw + nx] = 1
+                queue.append((nx, ny))
+
+    filled = 0
+    for y in range(ph):
+        for x in range(pw):
+            if not pixels[x, y] and not seen[y * pw + x]:
+                pixels[x, y] = 255
+                filled += 1
+
+    return padded.crop((1, 1, width + 1, height + 1)), filled
 
 
-# A shark's first dorsal fin is *falcate*: the leading edge rakes back convexly
-# to the apex, the trailing edge is strongly concave, and it ends in a "free
-# rear tip" projecting backwards, low and close to the body. That rear tip and
-# the notch under it are what make the silhouette read as a shark fin instead
-# of a triangle, and they still read at 12px once downscaled. Unit square,
-# y=0 at the apex.
-FIN_APEX = (0.40, 0.00)
-FIN_APEX_CTRL = (0.13, 0.26)   # bulges forward -> convex leading edge
-FIN_REAR_TIP = (1.00, 0.70)
-FIN_TRAIL_CTRL = (0.62, 0.22)  # pulls inward   -> concave trailing edge
-FIN_NOTCH = (0.60, 1.00)
-FIN_BASE_FRONT = (0.00, 1.00)
-
-# The fin sits on a waterline. Silhouette subtlety is lost below ~32px, so the
-# horizontal stroke is what signals "in the water" at small sizes.
-FIN_BODY_FRACTION = 0.76
-FIN_WATER_GAP = 0.07
-FIN_WATER_WEIGHT = 0.12
-FIN_WATER_SPREAD = 1.06
-
-FIN_MASTER_SIZE = 336
-
-
-def build_fin_mask(size=FIN_MASTER_SIZE, waterline=True):
-    """Return an 'L' mode mask holding the fin silhouette."""
-    outline = []
-    outline += quad_bezier(FIN_BASE_FRONT, FIN_APEX_CTRL, FIN_APEX)
-    outline += quad_bezier(FIN_APEX, FIN_TRAIL_CTRL, FIN_REAR_TIP)
-    outline.append(FIN_NOTCH)
-    outline.append(FIN_BASE_FRONT)
-
-    mask = Image.new("L", (size, size), 0)
-    draw = ImageDraw.Draw(mask)
-
-    body_height = size * FIN_BODY_FRACTION
-    draw.polygon([(x * (size - 1), y * body_height) for x, y in outline], fill=255)
-
-    if waterline:
-        weight = max(1, int(size * FIN_WATER_WEIGHT))
-        top = body_height + size * FIN_WATER_GAP
-        centre = size / 2.0
-        half = (size / 2.0) * FIN_WATER_SPREAD
-        draw.rectangle([centre - half, top, centre + half, top + weight], fill=255)
-
-    bbox = mask.getbbox()
-    return mask.crop(bbox) if bbox else mask
+def load_fin_art():
+    """Return the alpha mask of the supplied fin artwork, trimmed."""
+    art = Image.open(FIN_ART_PATH)
+    art.load()
+    mask = art.split()[-1] if art.mode == "RGBA" else art.convert("L")
+    box = mask.getbbox()
+    return mask.crop(box) if box else mask
 
 
 def generate_fin(out_path=None, quiet=False):
-    """Write the fin glyph as an alpha-only PNG."""
-    mask = build_fin_mask()
-    fin = Image.new("RGBA", mask.size, (0, 0, 0, 0))
-    fin.putalpha(mask)
+    """Write the solid fin marker the plugin draws on the map."""
+    solid, filled = fill_enclosed(load_fin_art())
+
+    fin = Image.new("RGBA", solid.size, (0, 0, 0, 0))
+    fin.putalpha(solid)
 
     if out_path is None:
         out_path = os.path.join(PLUGIN_DIR, "fin.png")
     fin.save(out_path, "PNG", optimize=True)
 
     if not quiet:
-        print(f"Wrote {out_path}  ({mask.size[0]}x{mask.size[1]} alpha mask)")
+        print(f"Wrote {out_path}  ({solid.size[0]}x{solid.size[1]} alpha mask, "
+              f"{filled} interior pixels filled)")
     return fin
 
 
@@ -336,15 +335,19 @@ ICON_SIZE = 512
 
 
 def generate_icon(out_path=None, quiet=False):
-    """Draw the plugin icon shown in the InkyPi web UI."""
+    """Draw the plugin icon shown in the InkyPi web UI.
+
+    Derived from the same fin artwork the map uses, so the icon and the markers
+    are recognisably the same thing.
+    """
     icon = Image.new("RGBA", (ICON_SIZE, ICON_SIZE), (0, 0, 0, 0))
 
-    mask = build_fin_mask()
-    target = int(ICON_SIZE * 0.74)
+    mask, _ = fill_enclosed(load_fin_art())
+
+    target = int(ICON_SIZE * 0.78)
     w, h = mask.size
     scale = target / max(w, h)
     fin = mask.resize((max(1, round(w * scale)), max(1, round(h * scale))), Image.LANCZOS)
-    fin = fin.point(lambda a: 255 if a >= 128 else 0)
 
     left = (ICON_SIZE - fin.size[0]) // 2
     top = (ICON_SIZE - fin.size[1]) // 2

@@ -36,6 +36,8 @@ logger = logging.getLogger(__name__)
 
 PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
 WORLD_MAP_PATH = os.path.join(PLUGIN_DIR, "world_map.png")
+# Derived from newfin.png at build time by filling its outline; see
+# tools/generate_assets.py for why the marker is solid rather than line art.
 FIN_PATH = os.path.join(PLUGIN_DIR, "fin.png")
 FONT_DIR = os.path.join(PLUGIN_DIR, "fonts")
 
@@ -46,6 +48,13 @@ ITALIC = "LiberationSerif-Italic.ttf"
 # --- iNaturalist ----------------------------------------------------------
 INAT_OBSERVATIONS_URL = "https://api.inaturalist.org/v1/observations"
 INAT_AUTOCOMPLETE_URL = "https://api.inaturalist.org/v1/taxa/autocomplete"
+INAT_PLACES_URL = "https://api.inaturalist.org/v1/places"
+
+# Administrative levels iNaturalist tags places with. Used to turn the raw
+# place_ids on an observation into a readable location.
+ADMIN_LEVEL_COUNTRY = 0
+ADMIN_LEVEL_STATE = 10
+ADMIN_LEVEL_COUNTY = 20
 
 # Selachii, the infraclass containing all sharks.
 #
@@ -82,16 +91,30 @@ BLACK = (0, 0, 0)
 FIN_COLOR = BLACK
 
 # --- Fin layout -----------------------------------------------------------
-# Sightings are binned into small cells for counting, then thinned so no two
-# fins are drawn closer than MIN_FIN_SEPARATION_PX. Binning alone is not enough:
-# a fin is placed at its cell's centroid rather than the cell centre, so two
-# adjacent cells can put their fins a couple of pixels apart and the glyphs
-# merge into a blob. Thinning by actual distance keeps the natural scatter of
-# real positions while guaranteeing every fin reads as a separate mark.
+# Sightings are binned into small cells for counting, then thinned by distance so
+# fins cannot overlap. Binning alone is not enough: a fin is placed at its cell's
+# centroid rather than the cell centre, so two adjacent cells can put their fins a
+# couple of pixels apart and the glyphs merge into a blob. Thinning by actual
+# distance keeps the natural scatter of real positions while guaranteeing every
+# fin reads as a separate mark.
 GRID_CELL_PX = 14
-MIN_FIN_SEPARATION_PX = 26
-FIN_MIN_PX = 11           # a single sighting
-FIN_MAX_PX = 18           # the busiest cell
+
+# Extra clearance between fins, on top of the glyph's own width. Separation has
+# to be derived from the drawn width rather than fixed: the artwork is wider than
+# it is tall, so a constant that looked right for one fin height silently allowed
+# overlaps at another.
+FIN_CLEARANCE_PX = 7
+
+# Every fin is the same size. Scaling them by how many sightings they stood for
+# made the map look busier than the data warranted, and the caption already
+# reports the total.
+FIN_HEIGHT_PX = 11
+
+# Threshold used to harden the glyph after downscaling. 128 is right for a solid
+# silhouette; line art needs a lower value, or strokes landing on part-covered
+# pixels drop out and the outline breaks up.
+FIN_ALPHA_THRESHOLD = 128
+
 PLACE_MAX_CHARS = 42      # place_guess is free text and can run long
 
 
@@ -180,6 +203,13 @@ class SharkMap(BasePlugin):
             sightings, total_reported = self.fetch_sightings(
                 lookback_days, species_filter)
             if sightings:
+                # Only the sighting the caption names needs a readable place, so
+                # the extra lookup is one request per refresh, not two hundred.
+                self._resolve_place_label(self._most_recent(sightings))
+                # place_ids exist only to feed that lookup; drop them before
+                # caching so the file stays small.
+                for sighting in sightings:
+                    sighting.pop("place_ids", None)
                 self._write_cache(cache_path, sightings, total_reported)
                 return sightings, total_reported, None
             # A successful but empty response is not worth caching; fall
@@ -274,6 +304,66 @@ class SharkMap(BasePlugin):
             "or clear the field to show all sharks."
         )
 
+    def _resolve_place_label(self, sighting):
+        """Turn a sighting's place_ids into a readable location, in place.
+
+        place_guess is free text typed by the observer and is often unusable: a
+        bare ISO country code such as "BS", a subdivision code such as
+        "DK-ND, DK", or a country name in the observer's own language such as
+        "Spagna" for Spain. Roughly one record in ten looks like this.
+
+        iNaturalist also tags each observation with place_ids, which resolve to
+        properly named places carrying an administrative level. Those give
+        "New Providence, Bahamas" instead of "BS", in English, regardless of who
+        entered the record.
+
+        Best effort only: on any failure the caption falls back to place_guess,
+        because a slightly cryptic location is much better than a failed refresh.
+        """
+        if not sighting:
+            return
+
+        place_ids = sighting.get("place_ids") or []
+        if not place_ids:
+            return
+
+        try:
+            session = get_http_session()
+            # One batched request. Cap the ids so a record tagged with dozens of
+            # project boundaries cannot build an unreasonable URL.
+            ids = ",".join(str(int(pid)) for pid in place_ids[:40])
+            response = session.get(
+                f"{INAT_PLACES_URL}/{ids}",
+                headers={"User-Agent": USER_AGENT}, timeout=REQUEST_TIMEOUT,
+            )
+            if response.status_code != 200:
+                logger.info("SharkMap: place lookup returned HTTP %s",
+                            response.status_code)
+                return
+
+            by_level = {}
+            for place in response.json().get("results") or []:
+                level = place.get("admin_level")
+                name = (place.get("name") or "").strip()
+                # Places without an admin level are ecoregions, project
+                # boundaries and similar; they are not locations a reader wants.
+                if level is None or not name:
+                    continue
+                by_level.setdefault(int(level), name)
+
+            # Most specific administrative unit, then the country, which is what
+            # actually orients someone looking at a world map.
+            specific = by_level.get(ADMIN_LEVEL_COUNTY) or by_level.get(ADMIN_LEVEL_STATE)
+            country = by_level.get(ADMIN_LEVEL_COUNTRY)
+            parts = [part for part in (specific, country) if part]
+
+            if parts:
+                sighting["place_label"] = ", ".join(parts)
+                logger.info("SharkMap: resolved place %r to %r",
+                            sighting.get("place"), sighting["place_label"])
+        except Exception as error:  # noqa: BLE001 - never break a refresh for a label
+            logger.info("SharkMap: place lookup failed (%s)", error)
+
     @staticmethod
     def _distil(record):
         """Reduce one API record to the fields we draw, or None if unusable."""
@@ -296,8 +386,13 @@ class SharkMap(BasePlugin):
             # the documented fallback.
             "common": taxon.get("preferred_common_name") or None,
             "scientific": taxon.get("name") or None,
-            # Free text typed by the observer. Often absent, sometimes long.
+            # Free text typed by the observer. Often absent, sometimes long, and
+            # sometimes just a country code. Used only as a fallback when the
+            # structured place lookup below cannot produce anything.
             "place": record.get("place_guess") or None,
+            # Structured place references, resolved to a readable name for the
+            # single sighting the caption describes, then discarded.
+            "place_ids": record.get("place_ids") or [],
             # time_observed_at is often null, in which case only the date is
             # known and we must not invent a time.
             "time": record.get("time_observed_at") or None,
@@ -432,9 +527,15 @@ class SharkMap(BasePlugin):
         draw = ImageDraw.Draw(canvas)
         self._draw_header(draw, width, header_height, scale)
 
+        # The glyph is prepared once: every fin is identical, and its drawn width
+        # is what decides how far apart fins have to be to stay distinct.
+        glyph = self._fin_glyph(scale)
+        separation = glyph.width + FIN_CLEARANCE_PX * scale
+
         latest = self._most_recent(sightings)
-        cells = self._bin_sightings(sightings, width, map_height, max_spots, latest)
-        self._draw_fins(canvas, cells, header_height, map_height, scale)
+        cells = self._bin_sightings(sightings, width, map_height, max_spots,
+                                    separation, latest)
+        self._draw_fins(canvas, glyph, cells, header_height, map_height)
 
         if show_strip:
             self._draw_strip(draw, latest, total_reported, width, height,
@@ -514,7 +615,8 @@ class SharkMap(BasePlugin):
                   font=self._font(BOLD, 8 * scale), fill=BLACK, anchor="mm")
 
     @staticmethod
-    def _bin_sightings(sightings, width, map_height, max_spots, latest=None):
+    def _bin_sightings(sightings, width, map_height, max_spots, separation,
+                       latest=None):
         """Group sightings into grid cells and return the cells to draw.
 
         One fin per record would be noise -- 200 overlapping glyphs. Binning
@@ -522,9 +624,9 @@ class SharkMap(BasePlugin):
         cell sits at the mean position of its own sightings rather than the cell
         centre, so fins land where the animals were actually reported.
 
-        Cells are then thinned so no two fins land within
-        MIN_FIN_SEPARATION_PX of each other, busiest first. Without this the
-        glyphs overlap in popular diving areas and merge into a single blob.
+        Cells are then thinned so no two fins land within `separation` pixels of
+        each other, busiest first. Without this the glyphs overlap in popular
+        diving areas and merge into a single blob.
 
         The cell holding `latest` is considered first, so it always survives the
         thinning. Nothing marks it on the map, but the caption describes that
@@ -561,7 +663,7 @@ class SharkMap(BasePlugin):
         if latest_key is not None and latest_key in cells:
             candidates.sort(key=lambda item: item[0] != latest_key)
 
-        minimum_squared = MIN_FIN_SEPARATION_PX ** 2
+        minimum_squared = separation ** 2
         kept = []
         for _key, cell in candidates:
             crowded = any(
@@ -577,56 +679,54 @@ class SharkMap(BasePlugin):
 
         return kept
 
-    def _draw_fins(self, canvas, cells, header_height, map_height, scale):
-        """Paste a fin per cell, sized by how many sightings it represents."""
-        if not cells:
-            return
+    def _fin_glyph(self, scale):
+        """Load and prepare the fin marker once, at the size it will be drawn.
 
+        Every fin is identical, so this is done a single time per render. Returns
+        a 1-bit mask; the caller pastes ink through it.
+        """
         try:
-            glyph = Image.open(FIN_PATH)
-            glyph.load()
-            mask = glyph.split()[-1] if glyph.mode == "RGBA" else glyph.convert("L")
+            art = Image.open(FIN_PATH)
+            art.load()
+            mask = art.split()[-1] if art.mode == "RGBA" else art.convert("L")
         except OSError as error:
             raise RuntimeError(
                 f"SharkMap could not load its fin glyph ({FIN_PATH}): {error}"
             ) from error
 
-        busiest = max(cell["count"] for cell in cells)
-        aspect = mask.size[0] / mask.size[1]
+        # Trim transparent margin so the requested height is the fin itself
+        # rather than the height of the artwork's canvas.
+        bbox = mask.getbbox()
+        if bbox:
+            mask = mask.crop(bbox)
 
-        # Draw ascending so the biggest fins finish on top.
-        for cell in sorted(cells, key=lambda c: c["count"]):
-            height_px = self._fin_height(cell["count"], busiest, scale)
-            width_px = max(6, int(round(height_px * aspect)))
+        height_px = max(6, int(round(FIN_HEIGHT_PX * scale)))
+        width_px = max(6, int(round(height_px * mask.size[0] / mask.size[1])))
 
-            # Resize then re-threshold: a soft alpha ramp would dither into
-            # grey speckle on the panel, so the silhouette stays hard-edged.
-            shape = mask.resize((width_px, height_px), Image.LANCZOS).point(
-                lambda alpha: 255 if alpha >= 128 else 0
-            )
-
-            # The glyph already contains its own waterline, so the fin is
-            # anchored at the bottom of the glyph and nothing extra is drawn.
-            left = int(round(cell["x"] - width_px / 2))
-            top = int(round(cell["y"] - height_px)) + header_height
-            left = max(0, min(canvas.width - width_px, left))
-            top = max(header_height,
-                      min(header_height + map_height - height_px, top))
-
-            canvas.paste(Image.new("RGB", shape.size, FIN_COLOR), (left, top), shape)
+        # Resize then re-threshold: a soft alpha ramp would dither into grey
+        # speckle on the panel, so the glyph stays hard-edged.
+        return mask.resize((width_px, height_px), Image.LANCZOS).point(
+            lambda alpha: 255 if alpha >= FIN_ALPHA_THRESHOLD else 0
+        )
 
     @staticmethod
-    def _fin_height(count, busiest, scale):
-        """Fin height in pixels, scaled by cell count.
+    def _draw_fins(canvas, glyph, cells, header_height, map_height):
+        """Paste the prepared fin at every kept cell position."""
+        if not cells:
+            return
 
-        Square-root scaling: a cell with 25 sightings should read as busier
-        than one with 1, but not 25 times taller.
-        """
-        low, high = FIN_MIN_PX * scale, FIN_MAX_PX * scale
-        if busiest <= 1:
-            return max(6, int(round(low)))
-        share = (count ** 0.5 - 1) / (busiest ** 0.5 - 1)
-        return max(6, int(round(low + share * (high - low))))
+        ink = Image.new("RGB", glyph.size, FIN_COLOR)
+        fin_w, fin_h = glyph.size
+
+        for cell in cells:
+            # The artwork includes its own waterline, so the fin is anchored at
+            # the bottom of the glyph and nothing extra is drawn.
+            left = int(round(cell["x"] - fin_w / 2))
+            top = int(round(cell["y"] - fin_h)) + header_height
+            left = max(0, min(canvas.width - fin_w, left))
+            top = max(header_height, min(header_height + map_height - fin_h, top))
+
+            canvas.paste(ink, (left, top), glyph)
 
     # ------------------------------------------------------------------
     # Caption strip
@@ -717,7 +817,8 @@ class SharkMap(BasePlugin):
             return ""
 
         parts = []
-        place = sighting.get("place")
+        # The resolved label when we have one, otherwise the observer's own text.
+        place = sighting.get("place_label") or sighting.get("place")
         if place:
             parts.append(self._truncate(" ".join(place.split()), PLACE_MAX_CHARS))
 
