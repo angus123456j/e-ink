@@ -1,9 +1,9 @@
 """SharkMap: a nautical-atlas world map of recent shark sightings.
 
 Drawn with Pillow rather than HTML, because Chromium costs 40+ seconds of boot
-and render time on a Pi Zero 2 W. Everything static -- coastline, graticule and
-place names -- is baked into world_map.png at build time, so a refresh only
-draws the header, the fins and the caption.
+and render time on a Pi Zero 2 W. Everything static -- coastlines and place
+names -- is baked into world_map.png at build time, so a refresh only draws the
+header, the fins and the caption.
 
 The whole design is black on white. The panel can show six colours, but two
 means every pixel is already exactly on-palette, so the driver never dithers
@@ -78,11 +78,8 @@ BLACK = (0, 0, 0)
 
 # The whole design is black on white. Using two colours means every pixel is
 # already exactly on-palette, so the driver never dithers and every edge stays
-# hard -- which is what keeps 1px linework and 8px type legible on a 0.2mm
-# pixel. The reference design's cyan ring is not reachable in any case: the
-# panel has no cyan.
+# hard -- which is what keeps 1px linework and 8px type legible on a 0.2mm pixel.
 FIN_COLOR = BLACK
-HIGHLIGHT_COLOR = BLACK
 
 # --- Fin layout -----------------------------------------------------------
 # Sightings are binned into small cells for counting, then thinned so no two
@@ -96,7 +93,6 @@ MIN_FIN_SEPARATION_PX = 26
 FIN_MIN_PX = 11           # a single sighting
 FIN_MAX_PX = 18           # the busiest cell
 PLACE_MAX_CHARS = 42      # place_guess is free text and can run long
-HIGHLIGHT_LABEL_CHARS = 24
 
 
 class SharkMap(BasePlugin):
@@ -437,17 +433,8 @@ class SharkMap(BasePlugin):
         self._draw_header(draw, width, header_height, scale)
 
         latest = self._most_recent(sightings)
-        cells, latest_cell = self._bin_sightings(
-            sightings, width, map_height, max_spots, latest)
-
-        # _draw_fins reports where it actually placed each fin, so the
-        # highlight can be drawn around the right one rather than at the raw
-        # coordinate -- fins sit at a cell centroid, which is not the same point.
-        placements = self._draw_fins(canvas, cells, header_height, map_height, scale)
-
-        if latest_cell is not None:
-            self._draw_highlight(draw, placements.get(id(latest_cell)),
-                                 latest, width, scale)
+        cells = self._bin_sightings(sightings, width, map_height, max_spots, latest)
+        self._draw_fins(canvas, cells, header_height, map_height, scale)
 
         if show_strip:
             self._draw_strip(draw, latest, total_reported, width, height,
@@ -525,21 +512,20 @@ class SharkMap(BasePlugin):
 
     @staticmethod
     def _bin_sightings(sightings, width, map_height, max_spots, latest=None):
-        """Group sightings into grid cells; return (cells, cell_of_latest).
+        """Group sightings into grid cells and return the cells to draw.
 
-        One fin per record would be noise -- 200 overlapping glyphs. Binning to
-        roughly fin-sized cells turns the same data into something that reads as
-        a map. Each surviving cell sits at the mean position of its own
-        sightings rather than the cell centre, so fins land where the animals
-        were actually reported.
+        One fin per record would be noise -- 200 overlapping glyphs. Binning
+        turns the same data into something that reads as a map. Each surviving
+        cell sits at the mean position of its own sightings rather than the cell
+        centre, so fins land where the animals were actually reported.
 
         Cells are then thinned so no two fins land within
         MIN_FIN_SEPARATION_PX of each other, busiest first. Without this the
         glyphs overlap in popular diving areas and merge into a single blob.
 
         The cell holding `latest` is considered first, so it always survives the
-        thinning and everything else yields to it. Otherwise the caption could
-        describe a sighting that has no fin on the map.
+        thinning. Nothing marks it on the map, but the caption describes that
+        sighting, so it would be odd for its location to have no fin at all.
         """
         def cell_key(lon, lat):
             x, y = project(lon, lat, width, map_height)
@@ -574,8 +560,7 @@ class SharkMap(BasePlugin):
 
         minimum_squared = MIN_FIN_SEPARATION_PX ** 2
         kept = []
-        latest_cell = None
-        for key, cell in candidates:
+        for _key, cell in candidates:
             crowded = any(
                 (cell["x"] - other["x"]) ** 2 + (cell["y"] - other["y"]) ** 2
                 < minimum_squared
@@ -584,22 +569,15 @@ class SharkMap(BasePlugin):
             if crowded:
                 continue
             kept.append(cell)
-            if key == latest_key:
-                latest_cell = cell
             if len(kept) >= max_spots:
                 break
 
-        return kept, latest_cell
+        return kept
 
     def _draw_fins(self, canvas, cells, header_height, map_height, scale):
-        """Paste a fin per cell, sized by how many sightings it represents.
-
-        Returns {id(cell): (left, top, width, height)} so the caller can ring a
-        particular fin without recomputing where it ended up.
-        """
-        placements = {}
+        """Paste a fin per cell, sized by how many sightings it represents."""
         if not cells:
-            return placements
+            return
 
         try:
             glyph = Image.open(FIN_PATH)
@@ -633,9 +611,6 @@ class SharkMap(BasePlugin):
                       min(header_height + map_height - height_px, top))
 
             canvas.paste(Image.new("RGB", shape.size, FIN_COLOR), (left, top), shape)
-            placements[id(cell)] = (left, top, width_px, height_px)
-
-        return placements
 
     @staticmethod
     def _fin_height(count, busiest, scale):
@@ -649,59 +624,6 @@ class SharkMap(BasePlugin):
             return max(6, int(round(low)))
         share = (count ** 0.5 - 1) / (busiest ** 0.5 - 1)
         return max(6, int(round(low + share * (high - low))))
-
-    def _draw_highlight(self, draw, placement, sighting, width, scale):
-        """Ring the fin for the newest sighting and name its place.
-
-        `placement` is the (left, top, w, h) actually used to paste that fin, so
-        the ring lands around the glyph rather than at the raw coordinate --
-        fins sit at a cell centroid, which is a different point.
-
-        The ring sits clear of the fin by a small margin, so a black ring around
-        a black fin still reads as two separate marks.
-        """
-        if not placement:
-            return
-
-        left, top, fin_w, fin_h = placement
-        centre_x = left + fin_w / 2
-        centre_y = top + fin_h / 2
-        radius = max(7, (max(fin_w, fin_h) / 2) + 4 * scale)
-
-        draw.ellipse([centre_x - radius, centre_y - radius,
-                      centre_x + radius, centre_y + radius],
-                     outline=HIGHLIGHT_COLOR, width=1)
-
-        label = self._highlight_label((sighting or {}).get("place"))
-        if not label:
-            return
-
-        font = self._font(BOLD, 8 * scale)
-        gap = radius + 4 * scale
-        label_width = draw.textlength(label, font=font) * 1.25
-        # Flip the label to the left near the right edge so it cannot run off.
-        if centre_x + gap + label_width > width:
-            self._letterspace(draw, (centre_x - gap - label_width, centre_y),
-                              label, font, HIGHLIGHT_COLOR,
-                              spacing=0.8, centre=False)
-        else:
-            self._letterspace(draw, (centre_x + gap, centre_y), label, font,
-                              HIGHLIGHT_COLOR, spacing=0.8, centre=False)
-
-    @staticmethod
-    def _highlight_label(place):
-        """Short, upper-case place name for the map annotation.
-
-        place_guess is free text, often a long administrative chain. The first
-        two components carry the useful part.
-        """
-        if not place:
-            return ""
-        parts = [p.strip() for p in place.split(",") if p.strip()]
-        label = ", ".join(parts[:2]) if parts else place.strip()
-        if len(label) > HIGHLIGHT_LABEL_CHARS:
-            label = label[:HIGHLIGHT_LABEL_CHARS].rstrip(" ,") + "…"
-        return label.upper()
 
     # ------------------------------------------------------------------
     # Caption strip
