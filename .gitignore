@@ -166,6 +166,12 @@ cython_debug/
 # Development artifacts
 mock_display_output/
 
+# SharkMap: cached iNaturalist responses (runtime) and downloaded Natural Earth
+# geometry plus style comparison renders (build time). None of this belongs in
+# the repo -- the committed PNGs are the deliverable.
+src/plugins/sharkmap/.cache/
+src/plugins/sharkmap/tools/.cache/
+
 # IDE files
 .idea
 
