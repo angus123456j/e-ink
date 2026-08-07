@@ -25,20 +25,21 @@ CANVAS_WIDTH = 800
 CANVAS_HEIGHT = 480
 
 HEADER_HEIGHT = 48
-STRIP_HEIGHT = 60
+STRIP_HEIGHT = 42
 
 MAP_WIDTH = CANVAS_WIDTH
-MAP_HEIGHT = CANVAS_HEIGHT - HEADER_HEIGHT - STRIP_HEIGHT  # 372
+MAP_HEIGHT = CANVAS_HEIGHT - HEADER_HEIGHT - STRIP_HEIGHT  # 390
 MAP_TOP = HEADER_HEIGHT
 
 # Equirectangular bounds.
 #
-# The poles are cropped deliberately. Sharks are not reported from the high
-# Arctic or Antarctica, so a full -90..90 map spends about a fifth of its
-# vertical space on empty ice. Trimming to -62..80 gives the inhabited
-# latitudes more room and matches how printed atlases frame a world map.
+# The far north is still cropped -- nothing is reported from the high Arctic and
+# it is all ice -- but the south now reaches far enough to include the Antarctic
+# coastline, so the map reads as a complete world rather than one that stops
+# short. 162 degrees of latitude over 390 pixels is 2.41 px/degree against
+# 2.22 px/degree horizontally, so the projection is very close to square.
 LON_MIN, LON_MAX = -180.0, 180.0
-LAT_MIN, LAT_MAX = -62.0, 80.0
+LAT_MIN, LAT_MAX = -82.0, 80.0
 
 
 def project(lon, lat, width=MAP_WIDTH, height=MAP_HEIGHT):

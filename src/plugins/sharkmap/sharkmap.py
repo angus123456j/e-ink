@@ -492,8 +492,11 @@ class SharkMap(BasePlugin):
         draw.line([(0, header_height - 1), (width, header_height - 1)],
                   fill=BLACK, width=1)
 
-        self._draw_compass(draw, width * 0.055, header_height * 0.48,
-                           header_height * 0.32, scale)
+        # Smaller and nudged down from the earlier version: the rose plus its
+        # "N" needs to clear the top edge, and at radius 0.32 of the header the
+        # letter was being clipped.
+        self._draw_compass(draw, width * 0.055, header_height * 0.56,
+                           header_height * 0.24, scale)
 
         # The source credit iNaturalist's terms ask for, given the prominence a
         # decorative brand block would otherwise take.
@@ -517,7 +520,7 @@ class SharkMap(BasePlugin):
             tip = (cx + dx * radius * 0.5, cy + dy * radius * 0.5)
             draw.polygon([tip, (cx, cy - radius * 0.13), (cx, cy + radius * 0.13)],
                          fill=BLACK)
-        draw.text((cx, cy - radius - 6 * scale), "N",
+        draw.text((cx, cy - radius - 5 * scale), "N",
                   font=self._font(BOLD, 8 * scale), fill=BLACK, anchor="mm")
 
     @staticmethod
@@ -710,16 +713,16 @@ class SharkMap(BasePlugin):
         draw.rectangle([0, top, width, height], fill=WHITE)
         draw.line([(0, top), (width, top)], fill=BLACK, width=2)
 
-        margin = 22 * scale
+        margin = 34 * scale
         divider = width * 0.375
 
         # --- left: what it is
-        name_font = self._font(BOLD, 12 * scale)
-        sci_font = self._font(ITALIC, 11 * scale)
-        available = divider - margin * 2
+        name_font = self._font(BOLD, 11 * scale)
+        sci_font = self._font(ITALIC, 10 * scale)
+        available = divider - margin - 12 * scale
 
         common = (self._species_name(sighting) if sighting else "No recent sightings")
-        self._letterspace(draw, (margin, top + strip_height * 0.33),
+        self._letterspace(draw, (margin, top + strip_height * 0.32),
                           self._fit_text(draw, common.upper(), name_font, available),
                           name_font, BLACK, spacing=1.1 * scale, centre=False)
 
@@ -727,22 +730,23 @@ class SharkMap(BasePlugin):
         # which happens whenever iNaturalist has no common name for the taxon.
         scientific = (sighting or {}).get("scientific")
         if scientific and scientific.casefold() != common.casefold():
-            draw.text((margin, top + strip_height * 0.66),
+            draw.text((margin, top + strip_height * 0.72),
                       self._fit_text(draw, scientific, sci_font, available),
                       font=sci_font, fill=BLACK, anchor="lm")
 
-        draw.line([(divider, top + 10 * scale), (divider, height - 10 * scale)],
+        draw.line([(divider, top + 6 * scale), (divider, height - 6 * scale)],
                   fill=BLACK, width=1)
 
         # --- right: where, when, and how much to trust it
-        text_x = divider + 22 * scale
-        available = width - text_x - margin * 0.5
+        text_x = divider + 34 * scale
+        available = width - text_x - 12 * scale
 
-        line_font = self._font(REGULAR, 12 * scale)
-        detail_font = self._font(REGULAR, 9 * scale)
-        note_font = self._font(ITALIC, 9 * scale)
+        # Sized to fit three lines inside a 42px strip without crowding.
+        line_font = self._font(REGULAR, 11 * scale)
+        detail_font = self._font(REGULAR, 8 * scale)
+        note_font = self._font(ITALIC, 8 * scale)
 
-        draw.text((text_x, top + strip_height * 0.28),
+        draw.text((text_x, top + strip_height * 0.26),
                   self._fit_text(draw, self._where_when(sighting), line_font, available),
                   font=line_font, fill=BLACK, anchor="lm")
 
@@ -750,7 +754,7 @@ class SharkMap(BasePlugin):
                   self._fit_text(draw, self._provenance(sighting), detail_font, available),
                   font=detail_font, fill=BLACK, anchor="lm")
 
-        draw.text((text_x, top + strip_height * 0.81),
+        draw.text((text_x, top + strip_height * 0.82),
                   self._fit_text(draw, self._note_text(total_reported, lookback_days,
                                                        stale_since),
                                  note_font, available),

@@ -174,6 +174,7 @@ LAND_LABELS = [
     ("AFRICA", 21, 3, 9),
     ("ASIA", 95, 47, 10),
     ("AUSTRALIA", 134, -25, 8),
+    ("ANTARCTICA", 20, -76, 8),
 ]
 
 # Ocean names in italic. With everything in black, the italic is what
@@ -184,6 +185,7 @@ OCEAN_LABELS = [
     ("NORTH ATLANTIC OCEAN", -41, 19, 8),
     ("SOUTH ATLANTIC OCEAN", -21, -36, 8),
     ("INDIAN OCEAN", 80, -30, 8),
+    ("SOUTHERN OCEAN", -60, -62, 8),
 ]
 
 
