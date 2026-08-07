@@ -4,32 +4,30 @@ Run this only when you want to regenerate the artwork; the plugin itself just
 loads the committed PNGs. Nothing here runs on the Raspberry Pi.
 
     python src/plugins/sharkmap/tools/generate_assets.py
-    python src/plugins/sharkmap/tools/generate_assets.py --tint 3 --compare
 
 It produces three files next to the plugin:
 
-  world_map.png  the nautical-atlas basemap: tinted ocean, white land, blue
-                 coastline, graticule and place labels, all baked in
+  world_map.png  the line-chart basemap: white ocean, black coastlines and
+                 black place labels
   fin.png        a shark-fin glyph whose *alpha channel* is the shape, so the
                  plugin can recolour it at draw time
   icon.png       the plugin icon for the InkyPi web UI
 
-Two ideas underpin the artwork.
+Two decisions worth knowing about.
 
-First, the basemap is drawn from vectors rather than downsampled from a
-photograph. A photo produces thousands of intermediate colours which the Inky
-driver then dithers into mud; filled polygons at the exact output resolution
-give flat colour that survives the six-colour conversion intact.
+The basemap is drawn from vectors rather than downsampled from a photograph. A
+photo produces thousands of intermediate colours which the Inky driver then
+dithers into mud; filled polygons and 1px strokes at the exact output
+resolution give flat colour and hard edges that survive the six-colour
+conversion untouched.
 
-Second, the pale blue ocean is a DESIGNED halftone. A Spectra 6 panel has
-saturated blue but no pale blue, so the ocean is a sparse lattice of pure blue
-pixels on pure white. Every pixel is already on-palette, so the driver has
-nothing to dither and passes it through untouched, while the eye averages the
-lattice into a tint. Letting the driver dither a genuinely pale colour instead
-would produce the speckled mess visible on photographic plugins.
-
-Everything static lives in the image so the Pi only has to draw fins, the
-header and the caption each refresh.
+The ocean is pure white, not a pale blue. Spectra 6 has saturated blue but no
+pale blue, and the obvious workaround -- a sparse lattice of blue pixels read as
+a tint -- does not survive contact with the hardware. The panel is about 159mm
+wide for 800 pixels, so one pixel is 0.2mm; the tightest useful lattice puts
+dots 0.8mm apart, while the eye resolves roughly 0.15mm at 50cm. The dots stay
+visible as dots instead of blending. White ocean with black coastlines is the
+honest version of this design at this pixel size.
 
 Land geometry is Natural Earth (naturalearthdata.com), which is in the public
 domain. It is downloaded on demand and is not committed to this repository.
@@ -52,26 +50,24 @@ import projection  # noqa: E402  (needs the sys.path line above)
 CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache")
 FONT_DIR = os.path.join(PLUGIN_DIR, "fonts")
 
-# --- Spectra 6 palette ----------------------------------------------------
+# --- Palette --------------------------------------------------------------
+# The design is deliberately black and white only. The panel can show six
+# colours, but using two means every pixel is already exactly on-palette, so
+# the driver never dithers anything and every edge stays hard. On a 0.2mm pixel
+# this is what keeps fine linework and small type legible.
 WHITE = (255, 255, 255)
 BLACK = (0, 0, 0)
-RED = (255, 0, 0)
-YELLOW = (255, 255, 0)
-BLUE = (0, 0, 255)
-GREEN = (0, 190, 0)
 
-# Ocean tint lattice pitch: one blue pixel every TINT_STEP**2, so a larger
-# number is a fainter tint. 4 reads as roughly (239,239,255); 3 as (227,227,255).
-# 2 is too strong -- the lattice becomes a visible pattern rather than a tint.
-DEFAULT_TINT_STEP = 4
+OCEAN_COLOR = WHITE
+LAND_COLOR = WHITE       # land is defined by its outline, as on a line chart
+COAST_COLOR = BLACK
 
 # Natural Earth land polygons. 50m has enough detail for real coastlines at
 # 800px wide; 110m is visibly blocky.
 LAND_URL = "https://raw.githubusercontent.com/nvkelso/natural-earth-vector/master/geojson/ne_50m_land.geojson"
 
-# Islands smaller than this (in square degrees) are dropped from the coastline.
-# At 800px wide, 50m data turns archipelagos into blue static that reads as
-# noise rather than geography; the reference atlas look depends on calm coasts.
+# Islands smaller than this (in square degrees) are dropped. At 800px wide, 50m
+# data turns archipelagos into static that reads as noise rather than geography.
 MIN_ISLAND_AREA = 0.75
 
 REGULAR = "LiberationSerif-Regular.ttf"
@@ -92,13 +88,12 @@ def letterspace(draw, xy, text, fnt, fill, spacing=1.5, centre=True):
     """Draw text with extra tracking, the way atlas labels are set.
 
     Pillow has no letter-spacing, so characters are placed individually.
-    Returns the total advance so callers can lay things out after it.
     """
     widths = [draw.textlength(ch, font=fnt) for ch in text]
     total = sum(widths) + spacing * (len(text) - 1)
     x = xy[0] - total / 2 if centre else xy[0]
-    for ch, width in zip(text, widths):
-        draw.text((x, xy[1]), ch, font=fnt, fill=fill, anchor="lm")
+    for char, width in zip(text, widths):
+        draw.text((x, xy[1]), char, font=fnt, fill=fill, anchor="lm")
         x += width + spacing
     return total
 
@@ -148,8 +143,8 @@ def iter_polygons(geojson):
 def ring_area(ring):
     """Absolute area of a ring in square degrees, via the shoelace formula.
 
-    Used only to decide whether an island is big enough to draw, so the
-    distortion of treating degrees as planar does not matter.
+    Only used to decide whether an island is big enough to draw, so treating
+    degrees as planar is fine.
     """
     total = 0.0
     for index in range(len(ring)):
@@ -163,52 +158,13 @@ def ring_area(ring):
 # Basemap
 # --------------------------------------------------------------------------
 
-def tint_ocean(image, step, width, height):
-    """Lay the sparse blue lattice that stands in for pale blue.
-
-    Rows are offset progressively so the dots form a diagonal lattice; a plain
-    square grid shows up as visible rows and columns.
-    """
-    if not step:
-        return
-    pixels = image.load()
-    for y in range(0, height, step):
-        offset = ((y // step) * (step // 2 + 1)) % step
-        for x in range(offset, width, step):
-            pixels[x, y] = BLUE
+# No graticule and no degree labels. A latitude/longitude grid is conventional
+# on an atlas plate, but at 800x480 it competes with the coastlines and the fins
+# for the same few pixels, and it carries no information this display needs --
+# the fins are read against the continents, not against coordinates.
 
 
-def draw_graticule(draw, width, height, pitch=7):
-    """Dotted 30-degree grid, sparse enough not to fight the ocean tint."""
-    for lon in range(-150, 180, 30):
-        x, _ = projection.project(lon, 0.0, width, height)
-        for y in range(2, height, pitch):
-            draw.point((x, y), fill=BLUE)
-
-    for lat in (-60, -30, 0, 30, 60):
-        _, y = projection.project(0.0, lat, width, height)
-        for x in range(2, width, pitch):
-            draw.point((x, y), fill=BLUE)
-
-
-def draw_degree_labels(draw, width, height):
-    """Latitude down the left edge, longitude along the bottom, both inset."""
-    small = font(REGULAR, 8)
-
-    for lat in (-60, -30, 0, 30, 60):
-        _, y = projection.project(0.0, lat, width, height)
-        hemisphere = "S" if lat < 0 else ("N" if lat > 0 else "")
-        draw.text((4, y), f"{abs(lat)}°{hemisphere}", font=small,
-                  fill=BLUE, anchor="lm")
-
-    for lon in range(-120, 180, 60):
-        x, _ = projection.project(lon, 0.0, width, height)
-        hemisphere = "W" if lon < 0 else ("E" if lon > 0 else "")
-        draw.text((x, height - 6), f"{abs(lon)}°{hemisphere}", font=small,
-                  fill=BLUE, anchor="mm")
-
-
-# Continents and countries, in black so they read against white land.
+# Continents and countries, in black to match the coastlines.
 LAND_LABELS = [
     ("CANADA", -101, 61, 8),
     ("UNITED STATES", -99, 41, 8),
@@ -220,26 +176,24 @@ LAND_LABELS = [
     ("AUSTRALIA", 134, -25, 8),
 ]
 
-# Ocean names in black rather than blue: blue italic over the blue tint was
-# too faint to read at 8px.
+# Ocean names in italic. With everything in black, the italic is what
+# distinguishes water labels from the upright land labels.
 OCEAN_LABELS = [
-    ("NORTH PACIFIC OCEAN", -147, 28, 8),
+    ("NORTH PACIFIC OCEAN", -147, 26, 8),
     ("SOUTH PACIFIC OCEAN", -125, -30, 8),
-    ("NORTH ATLANTIC OCEAN", -40, 20, 8),
-    ("SOUTH ATLANTIC OCEAN", -20, -36, 8),
+    ("NORTH ATLANTIC OCEAN", -41, 19, 8),
+    ("SOUTH ATLANTIC OCEAN", -21, -36, 8),
     ("INDIAN OCEAN", 80, -30, 8),
 ]
 
 
-def generate_world_map(tint_step=DEFAULT_TINT_STEP, out_path=None, quiet=False):
-    """Draw the atlas basemap: tint, land, coastline, graticule and labels."""
+def generate_world_map(out_path=None, quiet=False):
+    """Draw the basemap: white ocean, black coastlines, black place labels."""
     width, height = projection.MAP_WIDTH, projection.MAP_HEIGHT
     geojson = fetch_land_geojson()
 
-    image = Image.new("RGB", (width, height), WHITE)
+    image = Image.new("RGB", (width, height), OCEAN_COLOR)
     draw = ImageDraw.Draw(image)
-
-    tint_ocean(image, tint_step, width, height)
 
     polygons = list(iter_polygons(geojson))
 
@@ -251,40 +205,24 @@ def generate_world_map(tint_step=DEFAULT_TINT_STEP, out_path=None, quiet=False):
                 if rings and ring_area(rings[0]) >= MIN_ISLAND_AREA]
     dropped = len(polygons) - len(drawable)
 
-    # Land is pure white so it lifts cleanly out of the tinted ocean.
     for rings in drawable:
         outer = to_pixels(rings[0])
         if len(outer) >= 3:
-            draw.polygon(outer, fill=WHITE)
+            draw.polygon(outer, fill=LAND_COLOR)
 
     # Interior rings (inland seas such as the Caspian) read as water again.
     for rings in drawable:
         for hole in rings[1:]:
             pixels = to_pixels(hole)
             if len(pixels) >= 3:
-                draw.polygon(pixels, fill=BLUE if tint_step == 0 else WHITE)
-                if tint_step:
-                    # Re-tint the hole so it matches the surrounding ocean.
-                    bbox = [int(min(p[0] for p in pixels)), int(min(p[1] for p in pixels)),
-                            int(max(p[0] for p in pixels)), int(max(p[1] for p in pixels))]
-                    patch = Image.new("RGB", (max(1, bbox[2] - bbox[0]),
-                                              max(1, bbox[3] - bbox[1])), WHITE)
-                    tint_ocean(patch, tint_step, patch.width, patch.height)
-                    mask = Image.new("L", patch.size, 0)
-                    ImageDraw.Draw(mask).polygon(
-                        [(p[0] - bbox[0], p[1] - bbox[1]) for p in pixels], fill=255)
-                    image.paste(patch, (bbox[0], bbox[1]), mask)
+                draw.polygon(pixels, fill=OCEAN_COLOR)
 
-    draw_graticule(draw, width, height)
-
-    # Coastline last of the linework, so it sits above the graticule.
+    # Coastlines last of the linework, so nothing paints over them.
     for rings in drawable:
         for ring in rings:
             pixels = to_pixels(ring)
             if len(pixels) >= 2:
-                draw.line(pixels + [pixels[0]], fill=BLUE, width=1)
-
-    draw_degree_labels(draw, width, height)
+                draw.line(pixels + [pixels[0]], fill=COAST_COLOR, width=1)
 
     for text, lon, lat, size in LAND_LABELS:
         x, y = projection.project(lon, lat, width, height)
@@ -299,11 +237,10 @@ def generate_world_map(tint_step=DEFAULT_TINT_STEP, out_path=None, quiet=False):
     image.save(out_path, "PNG", optimize=True)
 
     if not quiet:
-        density = 0.0 if not tint_step else 1.0 / (tint_step ** 2)
-        perceived = tuple(round(255 * (1 - density) + c * density) for c in BLUE)
+        colours = image.getcolors(maxcolors=64)
         print(f"Wrote {out_path}")
-        print(f"  {width}x{height}, tint step {tint_step or 'none'} "
-              f"-> perceived ocean {perceived}")
+        print(f"  {width}x{height}, {len(colours) if colours else 'many'} "
+              f"distinct colours (want 2: white and black)")
         print(f"  {len(drawable)} land polygons drawn, {dropped} specks dropped "
               f"(< {MIN_ISLAND_AREA} sq deg)")
     return image
@@ -409,6 +346,7 @@ def generate_icon(out_path=None, quiet=False):
 
     left = (ICON_SIZE - fin.size[0]) // 2
     top = (ICON_SIZE - fin.size[1]) // 2
+    # Black, matching the fins on the map itself.
     icon.paste(Image.new("RGBA", fin.size, BLACK + (255,)), (left, top), fin)
 
     if out_path is None:
@@ -422,34 +360,13 @@ def generate_icon(out_path=None, quiet=False):
 
 # --------------------------------------------------------------------------
 
-def write_comparisons():
-    """Render several tint densities so the look can be compared at real size."""
-    os.makedirs(CACHE_DIR, exist_ok=True)
-    for step in (0, 5, 4, 3, 2):
-        path = os.path.join(CACHE_DIR, f"map_tint{step}.png")
-        generate_world_map(step, out_path=path, quiet=True)
-        print(f"  {path}")
-
-
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--tint", type=int, default=DEFAULT_TINT_STEP,
-                        help="ocean tint lattice pitch; larger is fainter, "
-                             "0 for a plain white ocean "
-                             f"(default: {DEFAULT_TINT_STEP})")
-    parser.add_argument("--compare", action="store_true",
-                        help="also write a range of tint densities to .cache/")
-    args = parser.parse_args()
+    argparse.ArgumentParser(description=__doc__).parse_args()
 
     print("=== SharkMap asset generation ===")
-    generate_world_map(args.tint)
+    generate_world_map()
     generate_fin()
     generate_icon()
-
-    if args.compare:
-        print("\nTint comparison renders:")
-        write_comparisons()
-
     print("\nDone.")
     return 0
 

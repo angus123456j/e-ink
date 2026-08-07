@@ -1,9 +1,14 @@
 """SharkMap: a nautical-atlas world map of recent shark sightings.
 
 Drawn with Pillow rather than HTML, because Chromium costs 40+ seconds of boot
-and render time on a Pi Zero 2 W. Everything static -- ocean tint, land,
-coastline, graticule, place names -- is baked into world_map.png at build time,
-so a refresh only draws the header, the fins, and the caption.
+and render time on a Pi Zero 2 W. Everything static -- coastline, graticule and
+place names -- is baked into world_map.png at build time, so a refresh only
+draws the header, the fins and the caption.
+
+The whole design is black on white. The panel can show six colours, but two
+means every pixel is already exactly on-palette, so the driver never dithers
+and every edge stays hard. At 0.2mm per pixel that is what keeps 1px linework
+and 8px type readable.
 
 Data comes from the iNaturalist API v1, which needs no key. See fetch_sightings
 for the query and the traps in it.
@@ -67,18 +72,27 @@ MIN_LOOKBACK_DAYS, MAX_LOOKBACK_DAYS = 1, 90
 DEFAULT_MAX_SPOTS = 40
 MIN_MAX_SPOTS, MAX_MAX_SPOTS = 5, 200
 
-# --- Spectra 6 palette ----------------------------------------------------
-# The panel shows only these six. Saturated values survive dithering; muted
-# ones turn to mud.
+# --- Palette --------------------------------------------------------------
 WHITE = (255, 255, 255)
 BLACK = (0, 0, 0)
-RED = (255, 0, 0)
-BLUE = (0, 0, 255)
+
+# The whole design is black on white. Using two colours means every pixel is
+# already exactly on-palette, so the driver never dithers and every edge stays
+# hard -- which is what keeps 1px linework and 8px type legible on a 0.2mm
+# pixel. The reference design's cyan ring is not reachable in any case: the
+# panel has no cyan.
+FIN_COLOR = BLACK
+HIGHLIGHT_COLOR = BLACK
 
 # --- Fin layout -----------------------------------------------------------
-# Sightings are binned into cells roughly one fin wide, so at most one fin
-# lands per cell and they do not pile up on each other.
-GRID_CELL_PX = 22
+# Sightings are binned into small cells for counting, then thinned so no two
+# fins are drawn closer than MIN_FIN_SEPARATION_PX. Binning alone is not enough:
+# a fin is placed at its cell's centroid rather than the cell centre, so two
+# adjacent cells can put their fins a couple of pixels apart and the glyphs
+# merge into a blob. Thinning by actual distance keeps the natural scatter of
+# real positions while guaranteeing every fin reads as a separate mark.
+GRID_CELL_PX = 14
+MIN_FIN_SEPARATION_PX = 26
 FIN_MIN_PX = 11           # a single sighting
 FIN_MAX_PX = 18           # the busiest cell
 PLACE_MAX_CHARS = 42      # place_guess is free text and can run long
@@ -422,13 +436,18 @@ class SharkMap(BasePlugin):
         draw = ImageDraw.Draw(canvas)
         self._draw_header(draw, width, header_height, scale)
 
-        cells = self._bin_sightings(sightings, width, map_height, max_spots)
-        self._draw_fins(canvas, cells, header_height, map_height, scale)
-
         latest = self._most_recent(sightings)
-        if latest:
-            self._draw_highlight(draw, latest, width, map_height,
-                                 header_height, scale)
+        cells, latest_cell = self._bin_sightings(
+            sightings, width, map_height, max_spots, latest)
+
+        # _draw_fins reports where it actually placed each fin, so the
+        # highlight can be drawn around the right one rather than at the raw
+        # coordinate -- fins sit at a cell centroid, which is not the same point.
+        placements = self._draw_fins(canvas, cells, header_height, map_height, scale)
+
+        if latest_cell is not None:
+            self._draw_highlight(draw, placements.get(id(latest_cell)),
+                                 latest, width, scale)
 
         if show_strip:
             self._draw_strip(draw, latest, total_reported, width, height,
@@ -467,7 +486,7 @@ class SharkMap(BasePlugin):
         self._letterspace(draw, (width / 2, header_height * 0.40),
                           "SHARK SIGHTINGS", title_font, BLACK, spacing=3.0 * scale)
         self._letterspace(draw, (width / 2, header_height * 0.75),
-                          "LIVE MARITIME OBSERVATIONS", sub_font, BLUE,
+                          "LIVE MARITIME OBSERVATIONS", sub_font, BLACK,
                           spacing=2.4 * scale)
 
         draw.line([(0, header_height - 1), (width, header_height - 1)],
@@ -480,10 +499,10 @@ class SharkMap(BasePlugin):
         # decorative brand block would otherwise take.
         credit_x = width - 150 * scale
         self._letterspace(draw, (credit_x, header_height * 0.36),
-                          "DATA: iNATURALIST", self._font(BOLD, 7 * scale),
+                          "DATA: iNATURALIST", self._font(BOLD, 8 * scale),
                           BLACK, spacing=1.0 * scale, centre=False)
         draw.text((credit_x, header_height * 0.66), "research-grade observations",
-                  font=self._font(ITALIC, 7 * scale), fill=BLUE, anchor="lm")
+                  font=self._font(ITALIC, 8.5 * scale), fill=BLACK, anchor="lm")
 
     def _draw_compass(self, draw, cx, cy, radius, scale):
         """A flat compass rose: four cardinal spikes plus four minor ones."""
@@ -497,43 +516,87 @@ class SharkMap(BasePlugin):
         for dx, dy in ((1, -1), (1, 1), (-1, 1), (-1, -1)):
             tip = (cx + dx * radius * 0.5, cy + dy * radius * 0.5)
             draw.polygon([tip, (cx, cy - radius * 0.13), (cx, cy + radius * 0.13)],
-                         fill=BLUE)
+                         fill=BLACK)
         draw.text((cx, cy - radius - 6 * scale), "N",
-                  font=self._font(BOLD, 7 * scale), fill=BLACK, anchor="mm")
+                  font=self._font(BOLD, 8 * scale), fill=BLACK, anchor="mm")
 
     @staticmethod
-    def _bin_sightings(sightings, width, map_height, max_spots):
-        """Group sightings into grid cells, keeping the busiest `max_spots`.
+    def _bin_sightings(sightings, width, map_height, max_spots, latest=None):
+        """Group sightings into grid cells; return (cells, cell_of_latest).
 
         One fin per record would be noise -- 200 overlapping glyphs. Binning to
         roughly fin-sized cells turns the same data into something that reads as
         a map. Each surviving cell sits at the mean position of its own
         sightings rather than the cell centre, so fins land where the animals
         were actually reported.
+
+        Cells are then thinned so no two fins land within
+        MIN_FIN_SEPARATION_PX of each other, busiest first. Without this the
+        glyphs overlap in popular diving areas and merge into a single blob.
+
+        The cell holding `latest` is considered first, so it always survives the
+        thinning and everything else yields to it. Otherwise the caption could
+        describe a sighting that has no fin on the map.
         """
+        def cell_key(lon, lat):
+            x, y = project(lon, lat, width, map_height)
+            return (int(x // GRID_CELL_PX), int(y // GRID_CELL_PX)), x, y
+
         buckets = {}
         for sighting in sightings:
-            x, y = project(sighting["lon"], sighting["lat"], width, map_height)
-            key = (int(x // GRID_CELL_PX), int(y // GRID_CELL_PX))
+            key, x, y = cell_key(sighting["lon"], sighting["lat"])
             bucket = buckets.setdefault(key, {"count": 0, "x": 0.0, "y": 0.0})
             bucket["count"] += 1
             bucket["x"] += x
             bucket["y"] += y
 
-        cells = [
-            {"count": b["count"], "x": b["x"] / b["count"], "y": b["y"] / b["count"]}
-            for b in buckets.values()
-        ]
+        cells = {
+            key: {"count": b["count"],
+                  "x": b["x"] / b["count"],
+                  "y": b["y"] / b["count"]}
+            for key, b in buckets.items()
+        }
 
-        # Busiest cells win when there are more occupied cells than fins
-        # allowed, so the map keeps the strongest signal.
-        cells.sort(key=lambda cell: cell["count"], reverse=True)
-        return cells[:max_spots]
+        latest_key = None
+        if latest:
+            latest_key, _, _ = cell_key(latest["lon"], latest["lat"])
+
+        # Busiest first, so where fins compete for space the stronger signal
+        # wins -- except the newest sighting, which is considered before all of
+        # them because the caption is about it.
+        candidates = sorted(cells.items(),
+                            key=lambda item: item[1]["count"], reverse=True)
+        if latest_key is not None and latest_key in cells:
+            candidates.sort(key=lambda item: item[0] != latest_key)
+
+        minimum_squared = MIN_FIN_SEPARATION_PX ** 2
+        kept = []
+        latest_cell = None
+        for key, cell in candidates:
+            crowded = any(
+                (cell["x"] - other["x"]) ** 2 + (cell["y"] - other["y"]) ** 2
+                < minimum_squared
+                for other in kept
+            )
+            if crowded:
+                continue
+            kept.append(cell)
+            if key == latest_key:
+                latest_cell = cell
+            if len(kept) >= max_spots:
+                break
+
+        return kept, latest_cell
 
     def _draw_fins(self, canvas, cells, header_height, map_height, scale):
-        """Paste a fin per cell, sized by how many sightings it represents."""
+        """Paste a fin per cell, sized by how many sightings it represents.
+
+        Returns {id(cell): (left, top, width, height)} so the caller can ring a
+        particular fin without recomputing where it ended up.
+        """
+        placements = {}
         if not cells:
-            return
+            return placements
 
         try:
             glyph = Image.open(FIN_PATH)
@@ -566,7 +629,10 @@ class SharkMap(BasePlugin):
             top = max(header_height,
                       min(header_height + map_height - height_px, top))
 
-            canvas.paste(Image.new("RGB", shape.size, BLACK), (left, top), shape)
+            canvas.paste(Image.new("RGB", shape.size, FIN_COLOR), (left, top), shape)
+            placements[id(cell)] = (left, top, width_px, height_px)
+
+        return placements
 
     @staticmethod
     def _fin_height(count, busiest, scale):
@@ -581,33 +647,43 @@ class SharkMap(BasePlugin):
         share = (count ** 0.5 - 1) / (busiest ** 0.5 - 1)
         return max(6, int(round(low + share * (high - low))))
 
-    def _draw_highlight(self, draw, sighting, width, map_height,
-                        header_height, scale):
-        """Ring the newest sighting and name its place.
+    def _draw_highlight(self, draw, placement, sighting, width, scale):
+        """Ring the fin for the newest sighting and name its place.
 
-        Red because the palette has no cyan, and because red also carries the
-        right meaning: this is the one the caption is describing.
+        `placement` is the (left, top, w, h) actually used to paste that fin, so
+        the ring lands around the glyph rather than at the raw coordinate --
+        fins sit at a cell centroid, which is a different point.
+
+        The ring sits clear of the fin by a small margin, so a black ring around
+        a black fin still reads as two separate marks.
         """
-        x, y = project(sighting["lon"], sighting["lat"], width, map_height)
-        y += header_height
-        radius = max(6, 12 * scale)
+        if not placement:
+            return
 
-        draw.ellipse([x - radius, y - radius, x + radius, y + radius],
-                     outline=RED, width=1)
+        left, top, fin_w, fin_h = placement
+        centre_x = left + fin_w / 2
+        centre_y = top + fin_h / 2
+        radius = max(7, (max(fin_w, fin_h) / 2) + 4 * scale)
 
-        label = self._highlight_label(sighting.get("place"))
+        draw.ellipse([centre_x - radius, centre_y - radius,
+                      centre_x + radius, centre_y + radius],
+                     outline=HIGHLIGHT_COLOR, width=1)
+
+        label = self._highlight_label((sighting or {}).get("place"))
         if not label:
             return
 
-        font = self._font(BOLD, 7 * scale)
-        gap = radius + 5 * scale
+        font = self._font(BOLD, 8 * scale)
+        gap = radius + 4 * scale
+        label_width = draw.textlength(label, font=font) * 1.25
         # Flip the label to the left near the right edge so it cannot run off.
-        if x + gap + draw.textlength(label, font=font) * 1.2 > width:
-            self._letterspace(draw, (x - gap, y - 6 * scale), label, font, RED,
+        if centre_x + gap + label_width > width:
+            self._letterspace(draw, (centre_x - gap - label_width, centre_y),
+                              label, font, HIGHLIGHT_COLOR,
                               spacing=0.8, centre=False)
         else:
-            self._letterspace(draw, (x + gap, y - 6 * scale), label, font, RED,
-                              spacing=0.8, centre=False)
+            self._letterspace(draw, (centre_x + gap, centre_y), label, font,
+                              HIGHLIGHT_COLOR, spacing=0.8, centre=False)
 
     @staticmethod
     def _highlight_label(place):
@@ -647,14 +723,16 @@ class SharkMap(BasePlugin):
                           self._fit_text(draw, common.upper(), name_font, available),
                           name_font, BLACK, spacing=1.1 * scale, centre=False)
 
+        # Suppress the italic line when it would just repeat the headline,
+        # which happens whenever iNaturalist has no common name for the taxon.
         scientific = (sighting or {}).get("scientific")
-        if scientific:
+        if scientific and scientific.casefold() != common.casefold():
             draw.text((margin, top + strip_height * 0.66),
                       self._fit_text(draw, scientific, sci_font, available),
-                      font=sci_font, fill=BLUE, anchor="lm")
+                      font=sci_font, fill=BLACK, anchor="lm")
 
         draw.line([(divider, top + 10 * scale), (divider, height - 10 * scale)],
-                  fill=BLUE, width=1)
+                  fill=BLACK, width=1)
 
         # --- right: where, when, and how much to trust it
         text_x = divider + 22 * scale
@@ -676,7 +754,7 @@ class SharkMap(BasePlugin):
                   self._fit_text(draw, self._note_text(total_reported, lookback_days,
                                                        stale_since),
                                  note_font, available),
-                  font=note_font, fill=BLUE, anchor="lm")
+                  font=note_font, fill=BLACK, anchor="lm")
 
     @staticmethod
     def _most_recent(sightings):
@@ -780,7 +858,8 @@ class SharkMap(BasePlugin):
         where sharks are. Saying "reported" keeps the display from overclaiming.
         """
         window = "24 hours" if lookback_days == 1 else f"{lookback_days} days"
-        note = (f"Most recent of {total_reported} sightings reported "
+        plural = "sighting" if total_reported == 1 else "sightings"
+        note = (f"Most recent of {total_reported} {plural} reported "
                 f"in the last {window}")
 
         if stale_since:
