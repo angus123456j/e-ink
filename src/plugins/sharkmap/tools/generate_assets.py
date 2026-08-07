@@ -88,16 +88,29 @@ def font(name, size):
     return _font_cache[key]
 
 
-def letterspace(draw, xy, text, fnt, fill, spacing=1.5, centre=True):
+# Type is collected into a mask and thresholded rather than drawn straight onto
+# the image. Pillow anti-aliases TrueType text, leaving grey pixels along every
+# stroke, and grey is not a colour this panel has -- the Inky driver dithers each
+# one into a scattered red, green or blue dot, so small labels come out speckled
+# and weak. Thresholding makes every text pixel pure black or pure white, which
+# the driver maps straight across.
+#
+# Slightly below the midpoint: at 8px a serif stem only partly covers its pixels,
+# and a strict 128 thins those strokes until they break.
+TEXT_THRESHOLD = 100
+
+
+def letterspace(draw, xy, text, fnt, spacing=1.5, centre=True):
     """Draw text with extra tracking, the way atlas labels are set.
 
     Pillow has no letter-spacing, so characters are placed individually.
+    `draw` must target a mask; see TEXT_THRESHOLD.
     """
     widths = [draw.textlength(ch, font=fnt) for ch in text]
     total = sum(widths) + spacing * (len(text) - 1)
     x = xy[0] - total / 2 if centre else xy[0]
     for char, width in zip(text, widths):
-        draw.text((x, xy[1]), char, font=fnt, fill=fill, anchor="lm")
+        draw.text((x, xy[1]), char, font=fnt, fill=255, anchor="lm")
         x += width + spacing
     return total
 
@@ -230,13 +243,21 @@ def generate_world_map(out_path=None, quiet=False):
             if len(pixels) >= 2:
                 draw.line(pixels + [pixels[0]], fill=COAST_COLOR, width=1)
 
+    # Labels are collected into a mask, thresholded, then stamped in solid black,
+    # so no anti-aliased grey survives into the committed image.
+    label_mask = Image.new("L", (width, height), 0)
+    label_draw = ImageDraw.Draw(label_mask)
+
     for text, lon, lat, size in LAND_LABELS:
         x, y = projection.project(lon, lat, width, height)
-        letterspace(draw, (x, y), text, font(REGULAR, size), BLACK, spacing=1.3)
+        letterspace(label_draw, (x, y), text, font(REGULAR, size), spacing=1.3)
 
     for text, lon, lat, size in OCEAN_LABELS:
         x, y = projection.project(lon, lat, width, height)
-        letterspace(draw, (x, y), text, font(ITALIC, size), BLACK, spacing=1.7)
+        letterspace(label_draw, (x, y), text, font(ITALIC, size), spacing=1.7)
+
+    hard = label_mask.point(lambda value: 255 if value >= TEXT_THRESHOLD else 0)
+    image.paste(Image.new("RGB", (width, height), BLACK), (0, 0), hard)
 
     if out_path is None:
         out_path = os.path.join(PLUGIN_DIR, "world_map.png")

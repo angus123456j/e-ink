@@ -77,17 +77,43 @@ def palette_image(colours):
     return image
 
 
-def render_to_panel(image, saturation):
-    """Quantise and dither exactly as the driver would."""
+def render_to_panel(image, saturation, appearance="pure"):
+    """Quantise and dither exactly as the driver would.
+
+    Two different palettes are in play, and confusing them makes the preview
+    misleading:
+
+      - The BLENDED palette is what the driver quantises *against*. It decides
+        which source colour becomes which of the six inks. This is the one that
+        depends on `saturation`.
+      - The pigment the panel then lays down is its own. It is not the blended
+        value. Rendering the result using the blended numbers paints "white" as
+        a mid grey and makes everything look far weaker than it will be.
+
+    So: choose indices with the blended palette, then show them with the pure
+    palette. `appearance="blended"` keeps the old behaviour for comparison.
+    """
     colours = blended_palette(saturation)
     quantised = image.convert("RGB").quantize(
         colors=len(colours), palette=palette_image(colours),
         dither=Image.Dither.FLOYDSTEINBERG,
     )
+
+    if appearance == "pure":
+        # Repaint the same indices with the panel's actual colours. Real e-ink
+        # white is a shade off paper and its black is closer to charcoal, so the
+        # truth sits between this and the blended render -- but this is much the
+        # closer of the two.
+        flat = []
+        for colour in DESATURATED_PALETTE:
+            flat.extend(colour)
+        flat.extend([0, 0, 0] * (256 - len(DESATURATED_PALETTE)))
+        quantised.putpalette(flat)
+
     return quantised.convert("RGB"), colours
 
 
-def report(image, panel, colours):
+def report(image, panel, colours, appearance="pure"):
     """Say how much of the source had to be dithered, and what it became."""
     total = image.width * image.height
     source_colours = image.convert("RGB").getcolors(maxcolors=10 ** 7)
@@ -99,8 +125,10 @@ def report(image, panel, colours):
           f"(the rest is what gets dithered)")
 
     counts = {colour: count for count, colour in panel.getcolors(maxcolors=64)}
+    shown = ([tuple(c) for c in DESATURATED_PALETTE] if appearance == "pure"
+             else colours)
     print("  panel output mix:")
-    for name, colour in zip(COLOUR_NAMES, colours):
+    for name, colour in zip(COLOUR_NAMES, shown):
         share = counts.get(colour, 0) / total * 100
         if share:
             print(f"    {name:7s} {str(colour):>17s}  {share:5.1f}%")
@@ -115,6 +143,10 @@ def main():
                              "matching InkyPi)")
     parser.add_argument("--sweep", action="store_true",
                         help="write a comparison across several saturation values")
+    parser.add_argument("--appearance", choices=("pure", "blended"), default="pure",
+                        help="'pure' shows the panel's own inks (default and more "
+                             "realistic); 'blended' paints the driver's "
+                             "quantisation targets, which look washed out")
     parser.add_argument("--out", help="output path (default: alongside the input)")
     args = parser.parse_args()
 
@@ -129,8 +161,8 @@ def main():
         panels = []
         for level in levels:
             print(f"\nsaturation {level}")
-            panel, colours = render_to_panel(source, level)
-            report(source, panel, colours)
+            panel, colours = render_to_panel(source, level, args.appearance)
+            report(source, panel, colours, args.appearance)
             panels.append((level, panel))
 
         gap = 8
@@ -145,9 +177,9 @@ def main():
         print("order top to bottom: " + ", ".join(f"saturation {lv}" for lv, _ in panels))
         return 0
 
-    panel, colours = render_to_panel(source, args.saturation)
+    panel, colours = render_to_panel(source, args.saturation, args.appearance)
     print(f"\nsaturation {args.saturation}")
-    report(source, panel, colours)
+    report(source, panel, colours, args.appearance)
 
     out = args.out or args.image.replace(".png", "_panel.png")
     panel.save(out)

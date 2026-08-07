@@ -118,6 +118,40 @@ FIN_ALPHA_THRESHOLD = 128
 PLACE_MAX_CHARS = 42      # place_guess is free text and can run long
 
 
+class CrispText:
+    """Collects text into a 1-bit mask so it can be pasted with hard edges.
+
+    Pillow anti-aliases TrueType text, which leaves grey pixels along every
+    stroke. Grey is not a colour this panel has, so the Inky driver dithers each
+    of those pixels into a scattered red, green or blue dot, and small type ends
+    up looking speckled and weak rather than black.
+
+    Drawing type into a mask and thresholding it means every text pixel is either
+    pure black or pure white, so the driver maps it straight across and the
+    letters stay hard. The cost is slightly chunkier small text, which is a good
+    trade at 8px on a 0.2mm pixel.
+    """
+
+    # Chosen a little below the midpoint: at 8px a serif stem covers only part of
+    # its pixels, and a strict 128 thins those strokes to the point of breaking.
+    THRESHOLD = 100
+
+    def __init__(self, size):
+        self.layer = Image.new("L", size, 0)
+        self.draw = ImageDraw.Draw(self.layer)
+
+    def text(self, xy, string, font, anchor="lm"):
+        self.draw.text(xy, string, font=font, fill=255, anchor=anchor)
+
+    def length(self, string, font):
+        return self.draw.textlength(string, font=font)
+
+    def flush(self, canvas, colour):
+        """Threshold the collected type and paste it onto the canvas."""
+        mask = self.layer.point(lambda value: 255 if value >= self.THRESHOLD else 0)
+        canvas.paste(Image.new("RGB", canvas.size, colour), (0, 0), mask)
+
+
 class SharkMap(BasePlugin):
     """Paints recent shark sightings onto a nautical-atlas world map."""
 
@@ -482,27 +516,27 @@ class SharkMap(BasePlugin):
             return ImageFont.load_default()
 
     @staticmethod
-    def _letterspace(draw, xy, text, font, fill, spacing=1.5, centre=True):
+    def _letterspace(ink, xy, text, font, spacing=1.5, centre=True):
         """Draw text with extra tracking, the way atlas labels are set.
 
         Pillow has no letter-spacing, so characters are placed individually.
         Returns the total advance.
         """
-        widths = [draw.textlength(ch, font=font) for ch in text]
+        widths = [ink.length(ch, font) for ch in text]
         total = sum(widths) + spacing * (len(text) - 1)
         x = xy[0] - total / 2 if centre else xy[0]
         for char, width in zip(text, widths):
-            draw.text((x, xy[1]), char, font=font, fill=fill, anchor="lm")
+            ink.text((x, xy[1]), char, font)
             x += width + spacing
         return total
 
     @staticmethod
-    def _fit_text(draw, text, font, max_width):
+    def _fit_text(ink, text, font, max_width):
         """Trim text with an ellipsis until it fits `max_width` pixels."""
-        if draw.textlength(text, font=font) <= max_width:
+        if ink.length(text, font) <= max_width:
             return text
         trimmed = text
-        while trimmed and draw.textlength(trimmed + "…", font=font) > max_width:
+        while trimmed and ink.length(trimmed + "…", font) > max_width:
             trimmed = trimmed[:-1]
         return trimmed.rstrip() + "…"
 
@@ -525,7 +559,10 @@ class SharkMap(BasePlugin):
         canvas.paste(self._basemap(width, map_height), (0, header_height))
 
         draw = ImageDraw.Draw(canvas)
-        self._draw_header(draw, width, header_height, scale)
+        # All type goes into this mask and is thresholded on the way out, so no
+        # anti-aliased grey ever reaches the panel. See CrispText.
+        ink = CrispText((width, height))
+        self._draw_header(draw, ink, width, header_height, scale)
 
         # The glyph is prepared once: every fin is identical, and its drawn width
         # is what decides how far apart fins have to be to stay distinct.
@@ -538,9 +575,10 @@ class SharkMap(BasePlugin):
         self._draw_fins(canvas, glyph, cells, header_height, map_height)
 
         if show_strip:
-            self._draw_strip(draw, latest, total_reported, width, height,
+            self._draw_strip(draw, ink, latest, total_reported, width, height,
                              strip_height, lookback_days, stale_since, scale)
 
+        ink.flush(canvas, BLACK)
         return canvas
 
     def _basemap(self, width, map_height):
@@ -564,7 +602,7 @@ class SharkMap(BasePlugin):
             basemap = basemap.resize((width, map_height), Image.NEAREST)
         return basemap
 
-    def _draw_header(self, draw, width, header_height, scale):
+    def _draw_header(self, draw, ink, width, header_height, scale):
         """Title block: name, subtitle, compass rose and the source credit."""
         draw.rectangle([0, 0, width, header_height], fill=WHITE)
 
@@ -573,10 +611,10 @@ class SharkMap(BasePlugin):
         title_font = self._font(BOLD, 16 * scale)
         sub_font = self._font(REGULAR, 8 * scale)
 
-        self._letterspace(draw, (width / 2, header_height * 0.38),
-                          "SHARK SIGHTINGS", title_font, BLACK, spacing=2.6 * scale)
-        self._letterspace(draw, (width / 2, header_height * 0.79),
-                          "LIVE MARITIME OBSERVATIONS", sub_font, BLACK,
+        self._letterspace(ink, (width / 2, header_height * 0.38),
+                          "SHARK SIGHTINGS", title_font, spacing=2.6 * scale)
+        self._letterspace(ink, (width / 2, header_height * 0.79),
+                          "LIVE MARITIME OBSERVATIONS", sub_font,
                           spacing=2.2 * scale)
 
         draw.line([(0, header_height - 1), (width, header_height - 1)],
@@ -585,19 +623,19 @@ class SharkMap(BasePlugin):
         # The rose plus its "N" has to fit inside a 34px band, so it is small and
         # sits low: the letter goes above the northern spike, and at a larger
         # radius it was being clipped by the top edge.
-        self._draw_compass(draw, width * 0.055, header_height * 0.62,
+        self._draw_compass(draw, ink, width * 0.055, header_height * 0.62,
                            header_height * 0.22, scale)
 
         # The source credit iNaturalist's terms ask for, given the prominence a
         # decorative brand block would otherwise take.
         credit_x = width - 150 * scale
-        self._letterspace(draw, (credit_x, header_height * 0.36),
+        self._letterspace(ink, (credit_x, header_height * 0.36),
                           "DATA: iNATURALIST", self._font(BOLD, 8 * scale),
-                          BLACK, spacing=1.0 * scale, centre=False)
-        draw.text((credit_x, header_height * 0.66), "research-grade observations",
-                  font=self._font(ITALIC, 8.5 * scale), fill=BLACK, anchor="lm")
+                          spacing=1.0 * scale, centre=False)
+        ink.text((credit_x, header_height * 0.66), "research-grade observations",
+                 self._font(ITALIC, 8.5 * scale))
 
-    def _draw_compass(self, draw, cx, cy, radius, scale):
+    def _draw_compass(self, draw, ink, cx, cy, radius, scale):
         """A flat compass rose: four cardinal spikes plus four minor ones."""
         radius = max(6, radius)
         for dx, dy in ((0, -1), (1, 0), (0, 1), (-1, 0)):
@@ -611,8 +649,8 @@ class SharkMap(BasePlugin):
             draw.polygon([tip, (cx, cy - radius * 0.13), (cx, cy + radius * 0.13)],
                          fill=BLACK)
         # Sits clear above the northern spike rather than tucked against it.
-        draw.text((cx, cy - radius - 6.5 * scale), "N",
-                  font=self._font(BOLD, 8 * scale), fill=BLACK, anchor="mm")
+        ink.text((cx, cy - radius - 6.5 * scale), "N",
+                 self._font(BOLD, 8 * scale), anchor="mm")
 
     @staticmethod
     def _bin_sightings(sightings, width, map_height, max_spots, separation,
@@ -731,7 +769,7 @@ class SharkMap(BasePlugin):
     # ------------------------------------------------------------------
     # Caption strip
     # ------------------------------------------------------------------
-    def _draw_strip(self, draw, sighting, total_reported, width, height,
+    def _draw_strip(self, draw, ink, sighting, total_reported, width, height,
                     strip_height, lookback_days, stale_since, scale):
         """Species on the left, circumstances on the right, as on a chart."""
         top = height - strip_height
@@ -747,17 +785,16 @@ class SharkMap(BasePlugin):
         available = divider - margin - 12 * scale
 
         common = (self._species_name(sighting) if sighting else "No recent sightings")
-        self._letterspace(draw, (margin, top + strip_height * 0.32),
-                          self._fit_text(draw, common.upper(), name_font, available),
-                          name_font, BLACK, spacing=1.1 * scale, centre=False)
+        self._letterspace(ink, (margin, top + strip_height * 0.32),
+                          self._fit_text(ink, common.upper(), name_font, available),
+                          name_font, spacing=1.1 * scale, centre=False)
 
         # Suppress the italic line when it would just repeat the headline,
         # which happens whenever iNaturalist has no common name for the taxon.
         scientific = (sighting or {}).get("scientific")
         if scientific and scientific.casefold() != common.casefold():
-            draw.text((margin, top + strip_height * 0.72),
-                      self._fit_text(draw, scientific, sci_font, available),
-                      font=sci_font, fill=BLACK, anchor="lm")
+            ink.text((margin, top + strip_height * 0.72),
+                     self._fit_text(ink, scientific, sci_font, available), sci_font)
 
         draw.line([(divider, top + 6 * scale), (divider, height - 6 * scale)],
                   fill=BLACK, width=1)
@@ -771,19 +808,19 @@ class SharkMap(BasePlugin):
         detail_font = self._font(REGULAR, 8 * scale)
         note_font = self._font(ITALIC, 8 * scale)
 
-        draw.text((text_x, top + strip_height * 0.26),
-                  self._fit_text(draw, self._where_when(sighting), line_font, available),
-                  font=line_font, fill=BLACK, anchor="lm")
+        ink.text((text_x, top + strip_height * 0.26),
+                 self._fit_text(ink, self._where_when(sighting), line_font, available),
+                 line_font)
 
-        draw.text((text_x, top + strip_height * 0.56),
-                  self._fit_text(draw, self._provenance(sighting), detail_font, available),
-                  font=detail_font, fill=BLACK, anchor="lm")
+        ink.text((text_x, top + strip_height * 0.56),
+                 self._fit_text(ink, self._provenance(sighting), detail_font, available),
+                 detail_font)
 
-        draw.text((text_x, top + strip_height * 0.82),
-                  self._fit_text(draw, self._note_text(total_reported, lookback_days,
-                                                       stale_since),
-                                 note_font, available),
-                  font=note_font, fill=BLACK, anchor="lm")
+        ink.text((text_x, top + strip_height * 0.82),
+                 self._fit_text(ink, self._note_text(total_reported, lookback_days,
+                                                     stale_since),
+                                note_font, available),
+                 note_font)
 
     @staticmethod
     def _most_recent(sightings):
