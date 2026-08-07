@@ -1,15 +1,12 @@
-"""SharkMap: a world map of recent shark sightings reported to iNaturalist.
+"""SharkMap: a nautical-atlas world map of recent shark sightings.
 
 Drawn with Pillow rather than HTML, because Chromium costs 40+ seconds of boot
-and render time on a Pi Zero 2 W. The whole render is a basemap paste plus a
-few dozen small shapes, so it finishes in well under a second.
+and render time on a Pi Zero 2 W. Everything static -- ocean tint, land,
+coastline, graticule, place names -- is baked into world_map.png at build time,
+so a refresh only draws the header, the fins, and the caption.
 
 Data comes from the iNaturalist API v1, which needs no key. See fetch_sightings
 for the query and the traps in it.
-
-Sightings are drawn as plain dots for now. fin.png is already generated and
-sitting next to this file for a later pass at the artwork; nothing here uses it
-yet, deliberately -- the point of this version is that the data path works.
 """
 
 import json
@@ -23,6 +20,7 @@ from PIL import Image, ImageDraw, ImageFont
 from plugins.base_plugin.base_plugin import BasePlugin
 from plugins.sharkmap.projection import (
     CANVAS_HEIGHT,
+    HEADER_HEIGHT,
     STRIP_HEIGHT,
     in_bounds,
     project,
@@ -33,7 +31,12 @@ logger = logging.getLogger(__name__)
 
 PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
 WORLD_MAP_PATH = os.path.join(PLUGIN_DIR, "world_map.png")
+FIN_PATH = os.path.join(PLUGIN_DIR, "fin.png")
 FONT_DIR = os.path.join(PLUGIN_DIR, "fonts")
+
+REGULAR = "LiberationSerif-Regular.ttf"
+BOLD = "LiberationSerif-Bold.ttf"
+ITALIC = "LiberationSerif-Italic.ttf"
 
 # --- iNaturalist ----------------------------------------------------------
 INAT_OBSERVATIONS_URL = "https://api.inaturalist.org/v1/observations"
@@ -70,19 +73,20 @@ MIN_MAX_SPOTS, MAX_MAX_SPOTS = 5, 200
 WHITE = (255, 255, 255)
 BLACK = (0, 0, 0)
 RED = (255, 0, 0)
+BLUE = (0, 0, 255)
 
-# --- Spot layout ----------------------------------------------------------
-# Observations are binned into square cells so 200 records do not become 200
-# overlapping dots. Cells are a little wider than the largest dot.
+# --- Fin layout -----------------------------------------------------------
+# Sightings are binned into cells roughly one fin wide, so at most one fin
+# lands per cell and they do not pile up on each other.
 GRID_CELL_PX = 22
-SPOT_MIN_RADIUS = 4      # a single sighting
-SPOT_MAX_RADIUS = 9      # the busiest cell
-HOTSPOT_COUNT = 3        # busiest cells drawn in red
-PLACE_MAX_CHARS = 40     # place_guess is free text and can run long
+FIN_MIN_PX = 11           # a single sighting
+FIN_MAX_PX = 18           # the busiest cell
+PLACE_MAX_CHARS = 42      # place_guess is free text and can run long
+HIGHLIGHT_LABEL_CHARS = 24
 
 
 class SharkMap(BasePlugin):
-    """Paints recent shark sightings onto an equirectangular world map."""
+    """Paints recent shark sightings onto a nautical-atlas world map."""
 
     # ------------------------------------------------------------------
     # InkyPi entry point
@@ -158,7 +162,7 @@ class SharkMap(BasePlugin):
         otherwise the time the cache was written.
 
         total_reported is how many observations matched the query overall,
-        which can exceed the page we fetched.
+        which can exceed the single page we fetched.
         """
         cache_path = self._cache_path(lookback_days, species_filter)
 
@@ -288,6 +292,9 @@ class SharkMap(BasePlugin):
             # known and we must not invent a time.
             "time": record.get("time_observed_at") or None,
             "date": record.get("observed_on") or None,
+            # iNaturalist randomises coordinates for threatened species. Worth
+            # saying so rather than implying the position is exact.
+            "obscured": bool(record.get("obscured") or record.get("geoprivacy")),
         }
 
     # ------------------------------------------------------------------
@@ -353,28 +360,79 @@ class SharkMap(BasePlugin):
             return [], 0, None
 
     # ------------------------------------------------------------------
+    # Fonts and text
+    # ------------------------------------------------------------------
+    def _font(self, filename, size):
+        """Load a bundled font.
+
+        Liberation Serif ships with the plugin because it is metrically
+        identical to Times New Roman but freely redistributable, and Raspberry
+        Pi OS has no Times New Roman to fall back on.
+        """
+        path = os.path.join(FONT_DIR, filename)
+        try:
+            return ImageFont.truetype(path, max(6, int(size)))
+        except OSError:
+            logger.warning("SharkMap: missing font %s, using PIL default", path)
+            return ImageFont.load_default()
+
+    @staticmethod
+    def _letterspace(draw, xy, text, font, fill, spacing=1.5, centre=True):
+        """Draw text with extra tracking, the way atlas labels are set.
+
+        Pillow has no letter-spacing, so characters are placed individually.
+        Returns the total advance.
+        """
+        widths = [draw.textlength(ch, font=font) for ch in text]
+        total = sum(widths) + spacing * (len(text) - 1)
+        x = xy[0] - total / 2 if centre else xy[0]
+        for char, width in zip(text, widths):
+            draw.text((x, xy[1]), char, font=font, fill=fill, anchor="lm")
+            x += width + spacing
+        return total
+
+    @staticmethod
+    def _fit_text(draw, text, font, max_width):
+        """Trim text with an ellipsis until it fits `max_width` pixels."""
+        if draw.textlength(text, font=font) <= max_width:
+            return text
+        trimmed = text
+        while trimmed and draw.textlength(trimmed + "…", font=font) > max_width:
+            trimmed = trimmed[:-1]
+        return trimmed.rstrip() + "…"
+
+    # ------------------------------------------------------------------
     # Rendering
     # ------------------------------------------------------------------
     def _render(self, dimensions, sightings, total_reported, max_spots,
                 show_strip, lookback_days, stale_since):
         width, height = int(dimensions[0]), int(dimensions[1])
 
-        # Scale the strip with the canvas so non-native resolutions stay
-        # proportional. Zero when the caption is switched off.
-        strip_height = 0
-        if show_strip:
-            strip_height = max(28, round(height * STRIP_HEIGHT / CANVAS_HEIGHT))
-        map_height = height - strip_height
+        # Everything is authored for 800x480. On any other panel the bands and
+        # type scale proportionally rather than being clipped.
+        scale = height / CANVAS_HEIGHT
+
+        header_height = max(24, round(HEADER_HEIGHT * scale))
+        strip_height = max(30, round(STRIP_HEIGHT * scale)) if show_strip else 0
+        map_height = height - header_height - strip_height
 
         canvas = Image.new("RGB", (width, height), WHITE)
-        canvas.paste(self._basemap(width, map_height), (0, 0))
+        canvas.paste(self._basemap(width, map_height), (0, header_height))
+
+        draw = ImageDraw.Draw(canvas)
+        self._draw_header(draw, width, header_height, scale)
 
         cells = self._bin_sightings(sightings, width, map_height, max_spots)
-        self._draw_spots(canvas, cells)
+        self._draw_fins(canvas, cells, header_height, map_height, scale)
+
+        latest = self._most_recent(sightings)
+        if latest:
+            self._draw_highlight(draw, latest, width, map_height,
+                                 header_height, scale)
 
         if show_strip:
-            self._draw_strip(canvas, sightings, total_reported, width, height,
-                             strip_height, lookback_days, stale_since)
+            self._draw_strip(draw, latest, total_reported, width, height,
+                             strip_height, lookback_days, stale_since, scale)
 
         return canvas
 
@@ -382,9 +440,9 @@ class SharkMap(BasePlugin):
         """Load the basemap, resizing only if the panel is not 800x480.
 
         NEAREST is deliberate: it cannot invent intermediate colours, so the
-        image stays exactly three flat tones at any size. A smoother filter
-        would blend ocean into land, and the Inky dither would turn those
-        blended edges into noise.
+        image stays exactly on-palette at any size. A smoother filter would
+        blend the ocean tint lattice into intermediate blues, and the driver
+        would then dither those into visible noise.
         """
         try:
             basemap = Image.open(WORLD_MAP_PATH)
@@ -399,14 +457,59 @@ class SharkMap(BasePlugin):
             basemap = basemap.resize((width, map_height), Image.NEAREST)
         return basemap
 
+    def _draw_header(self, draw, width, header_height, scale):
+        """Title block: name, subtitle, compass rose and the source credit."""
+        draw.rectangle([0, 0, width, header_height], fill=WHITE)
+
+        title_font = self._font(BOLD, 22 * scale)
+        sub_font = self._font(REGULAR, 9 * scale)
+
+        self._letterspace(draw, (width / 2, header_height * 0.40),
+                          "SHARK SIGHTINGS", title_font, BLACK, spacing=3.0 * scale)
+        self._letterspace(draw, (width / 2, header_height * 0.75),
+                          "LIVE MARITIME OBSERVATIONS", sub_font, BLUE,
+                          spacing=2.4 * scale)
+
+        draw.line([(0, header_height - 1), (width, header_height - 1)],
+                  fill=BLACK, width=1)
+
+        self._draw_compass(draw, width * 0.055, header_height * 0.48,
+                           header_height * 0.32, scale)
+
+        # The source credit iNaturalist's terms ask for, given the prominence a
+        # decorative brand block would otherwise take.
+        credit_x = width - 150 * scale
+        self._letterspace(draw, (credit_x, header_height * 0.36),
+                          "DATA: iNATURALIST", self._font(BOLD, 7 * scale),
+                          BLACK, spacing=1.0 * scale, centre=False)
+        draw.text((credit_x, header_height * 0.66), "research-grade observations",
+                  font=self._font(ITALIC, 7 * scale), fill=BLUE, anchor="lm")
+
+    def _draw_compass(self, draw, cx, cy, radius, scale):
+        """A flat compass rose: four cardinal spikes plus four minor ones."""
+        radius = max(6, radius)
+        for dx, dy in ((0, -1), (1, 0), (0, 1), (-1, 0)):
+            tip = (cx + dx * radius, cy + dy * radius)
+            base = radius * 0.26
+            points = ([tip, (cx, cy - base), (cx, cy + base)] if dx
+                      else [tip, (cx - base, cy), (cx + base, cy)])
+            draw.polygon(points, fill=BLACK)
+        for dx, dy in ((1, -1), (1, 1), (-1, 1), (-1, -1)):
+            tip = (cx + dx * radius * 0.5, cy + dy * radius * 0.5)
+            draw.polygon([tip, (cx, cy - radius * 0.13), (cx, cy + radius * 0.13)],
+                         fill=BLUE)
+        draw.text((cx, cy - radius - 6 * scale), "N",
+                  font=self._font(BOLD, 7 * scale), fill=BLACK, anchor="mm")
+
     @staticmethod
     def _bin_sightings(sightings, width, map_height, max_spots):
         """Group sightings into grid cells, keeping the busiest `max_spots`.
 
-        One dot per record would be noise -- 200 overlapping marks. Binning to
-        cells turns the same data into something readable. Each surviving cell
-        is placed at the mean position of its own sightings rather than the
-        cell centre, so dots sit where the animals were actually reported.
+        One fin per record would be noise -- 200 overlapping glyphs. Binning to
+        roughly fin-sized cells turns the same data into something that reads as
+        a map. Each surviving cell sits at the mean position of its own
+        sightings rather than the cell centre, so fins land where the animals
+        were actually reported.
         """
         buckets = {}
         for sighting in sightings:
@@ -422,93 +525,158 @@ class SharkMap(BasePlugin):
             for b in buckets.values()
         ]
 
-        # Busiest cells win when there are more occupied cells than dots
+        # Busiest cells win when there are more occupied cells than fins
         # allowed, so the map keeps the strongest signal.
         cells.sort(key=lambda cell: cell["count"], reverse=True)
         return cells[:max_spots]
 
-    def _draw_spots(self, canvas, cells):
-        """Draw one dot per cell, sized by count, busiest few in red.
-
-        Each dot gets a white outline so it stays legible over the land fill as
-        well as over the white ocean.
-        """
+    def _draw_fins(self, canvas, cells, header_height, map_height, scale):
+        """Paste a fin per cell, sized by how many sightings it represents."""
         if not cells:
             return
 
-        draw = ImageDraw.Draw(canvas)
+        try:
+            glyph = Image.open(FIN_PATH)
+            glyph.load()
+            mask = glyph.split()[-1] if glyph.mode == "RGBA" else glyph.convert("L")
+        except OSError as error:
+            raise RuntimeError(
+                f"SharkMap could not load its fin glyph ({FIN_PATH}): {error}"
+            ) from error
+
         busiest = max(cell["count"] for cell in cells)
+        aspect = mask.size[0] / mask.size[1]
 
-        hotspots = {
-            id(cell) for cell in cells[:HOTSPOT_COUNT] if cell["count"] > 1
-        }
-
-        # Draw ascending so the biggest dots end up on top.
+        # Draw ascending so the biggest fins finish on top.
         for cell in sorted(cells, key=lambda c: c["count"]):
-            radius = self._spot_radius(cell["count"], busiest)
-            colour = RED if id(cell) in hotspots else BLACK
-            box = [
-                cell["x"] - radius, cell["y"] - radius,
-                cell["x"] + radius, cell["y"] + radius,
-            ]
-            draw.ellipse(box, fill=colour, outline=WHITE, width=2)
+            height_px = self._fin_height(cell["count"], busiest, scale)
+            width_px = max(6, int(round(height_px * aspect)))
+
+            # Resize then re-threshold: a soft alpha ramp would dither into
+            # grey speckle on the panel, so the silhouette stays hard-edged.
+            shape = mask.resize((width_px, height_px), Image.LANCZOS).point(
+                lambda alpha: 255 if alpha >= 128 else 0
+            )
+
+            # The glyph already contains its own waterline, so the fin is
+            # anchored at the bottom of the glyph and nothing extra is drawn.
+            left = int(round(cell["x"] - width_px / 2))
+            top = int(round(cell["y"] - height_px)) + header_height
+            left = max(0, min(canvas.width - width_px, left))
+            top = max(header_height,
+                      min(header_height + map_height - height_px, top))
+
+            canvas.paste(Image.new("RGB", shape.size, BLACK), (left, top), shape)
 
     @staticmethod
-    def _spot_radius(count, busiest):
-        """Dot radius in pixels, scaled by cell count.
+    def _fin_height(count, busiest, scale):
+        """Fin height in pixels, scaled by cell count.
 
         Square-root scaling: a cell with 25 sightings should read as busier
-        than one with 1, but not 25 times wider.
+        than one with 1, but not 25 times taller.
         """
+        low, high = FIN_MIN_PX * scale, FIN_MAX_PX * scale
         if busiest <= 1:
-            return SPOT_MIN_RADIUS
+            return max(6, int(round(low)))
         share = (count ** 0.5 - 1) / (busiest ** 0.5 - 1)
-        return int(round(SPOT_MIN_RADIUS + share * (SPOT_MAX_RADIUS - SPOT_MIN_RADIUS)))
+        return max(6, int(round(low + share * (high - low))))
+
+    def _draw_highlight(self, draw, sighting, width, map_height,
+                        header_height, scale):
+        """Ring the newest sighting and name its place.
+
+        Red because the palette has no cyan, and because red also carries the
+        right meaning: this is the one the caption is describing.
+        """
+        x, y = project(sighting["lon"], sighting["lat"], width, map_height)
+        y += header_height
+        radius = max(6, 12 * scale)
+
+        draw.ellipse([x - radius, y - radius, x + radius, y + radius],
+                     outline=RED, width=1)
+
+        label = self._highlight_label(sighting.get("place"))
+        if not label:
+            return
+
+        font = self._font(BOLD, 7 * scale)
+        gap = radius + 5 * scale
+        # Flip the label to the left near the right edge so it cannot run off.
+        if x + gap + draw.textlength(label, font=font) * 1.2 > width:
+            self._letterspace(draw, (x - gap, y - 6 * scale), label, font, RED,
+                              spacing=0.8, centre=False)
+        else:
+            self._letterspace(draw, (x + gap, y - 6 * scale), label, font, RED,
+                              spacing=0.8, centre=False)
+
+    @staticmethod
+    def _highlight_label(place):
+        """Short, upper-case place name for the map annotation.
+
+        place_guess is free text, often a long administrative chain. The first
+        two components carry the useful part.
+        """
+        if not place:
+            return ""
+        parts = [p.strip() for p in place.split(",") if p.strip()]
+        label = ", ".join(parts[:2]) if parts else place.strip()
+        if len(label) > HIGHLIGHT_LABEL_CHARS:
+            label = label[:HIGHLIGHT_LABEL_CHARS].rstrip(" ,") + "…"
+        return label.upper()
 
     # ------------------------------------------------------------------
     # Caption strip
     # ------------------------------------------------------------------
-    def _draw_strip(self, canvas, sightings, total_reported, width, height,
-                    strip_height, lookback_days, stale_since):
-        """Bottom strip: the single most recent sighting, plus honest framing."""
+    def _draw_strip(self, draw, sighting, total_reported, width, height,
+                    strip_height, lookback_days, stale_since, scale):
+        """Species on the left, circumstances on the right, as on a chart."""
         top = height - strip_height
-        draw = ImageDraw.Draw(canvas)
-
         draw.rectangle([0, top, width, height], fill=WHITE)
         draw.line([(0, top), (width, top)], fill=BLACK, width=2)
 
-        headline_font = self._font("LiberationSerif-Bold.ttf",
-                                   max(13, int(strip_height * 0.40)))
-        note_font = self._font("LiberationSerif-Italic.ttf",
-                               max(10, int(strip_height * 0.26)))
+        margin = 22 * scale
+        divider = width * 0.375
 
-        margin = max(8, int(width * 0.0125))
-        available = width - margin * 2
+        # --- left: what it is
+        name_font = self._font(BOLD, 12 * scale)
+        sci_font = self._font(ITALIC, 11 * scale)
+        available = divider - margin * 2
 
-        headline = self._headline_text(self._most_recent(sightings))
-        note = self._note_text(total_reported, lookback_days, stale_since)
+        common = (self._species_name(sighting) if sighting else "No recent sightings")
+        self._letterspace(draw, (margin, top + strip_height * 0.33),
+                          self._fit_text(draw, common.upper(), name_font, available),
+                          name_font, BLACK, spacing=1.1 * scale, centre=False)
 
-        # Two lines inside the strip: the sighting, then the framing.
-        draw.text((margin, top + strip_height * 0.30),
-                  self._fit_text(draw, headline, headline_font, available),
-                  font=headline_font, fill=BLACK, anchor="lm")
-        draw.text((margin, top + strip_height * 0.74),
-                  self._fit_text(draw, note, note_font, available),
-                  font=note_font, fill=BLACK, anchor="lm")
+        scientific = (sighting or {}).get("scientific")
+        if scientific:
+            draw.text((margin, top + strip_height * 0.66),
+                      self._fit_text(draw, scientific, sci_font, available),
+                      font=sci_font, fill=BLUE, anchor="lm")
 
-    def _font(self, filename, size):
-        """Load a bundled font.
+        draw.line([(divider, top + 10 * scale), (divider, height - 10 * scale)],
+                  fill=BLUE, width=1)
 
-        Liberation Serif ships with the plugin because it is metrically
-        identical to Times New Roman but freely redistributable, and Raspberry
-        Pi OS has no Times New Roman to fall back on.
-        """
-        path = os.path.join(FONT_DIR, filename)
-        try:
-            return ImageFont.truetype(path, size)
-        except OSError:
-            logger.warning("SharkMap: missing font %s, using PIL default", path)
-            return ImageFont.load_default()
+        # --- right: where, when, and how much to trust it
+        text_x = divider + 22 * scale
+        available = width - text_x - margin * 0.5
+
+        line_font = self._font(REGULAR, 12 * scale)
+        detail_font = self._font(REGULAR, 9 * scale)
+        note_font = self._font(ITALIC, 9 * scale)
+
+        draw.text((text_x, top + strip_height * 0.28),
+                  self._fit_text(draw, self._where_when(sighting), line_font, available),
+                  font=line_font, fill=BLACK, anchor="lm")
+
+        draw.text((text_x, top + strip_height * 0.56),
+                  self._fit_text(draw, self._provenance(sighting), detail_font, available),
+                  font=detail_font, fill=BLACK, anchor="lm")
+
+        draw.text((text_x, top + strip_height * 0.81),
+                  self._fit_text(draw, self._note_text(total_reported, lookback_days,
+                                                       stale_since),
+                                 note_font, available),
+                  font=note_font, fill=BLUE, anchor="lm")
 
     @staticmethod
     def _most_recent(sightings):
@@ -530,13 +698,18 @@ class SharkMap(BasePlugin):
 
         return max(sightings, key=sort_key)
 
-    def _headline_text(self, sighting):
-        """"Tiger Shark - Oahu, HI, USA - 3 hours ago", degrading gracefully."""
+    @staticmethod
+    def _species_name(sighting):
+        """Common name if iNaturalist has one, else the scientific name."""
+        return (sighting.get("common") or sighting.get("scientific")
+                or "Unidentified shark")
+
+    def _where_when(self, sighting):
+        """"Cape Cod, Massachusetts  ·  18 minutes ago", degrading gracefully."""
         if not sighting:
-            return "No recent sightings"
+            return ""
 
-        parts = [self._species_name(sighting)]
-
+        parts = []
         place = sighting.get("place")
         if place:
             parts.append(self._truncate(" ".join(place.split()), PLACE_MAX_CHARS))
@@ -545,12 +718,22 @@ class SharkMap(BasePlugin):
         if when:
             parts.append(when)
 
-        return "  ·  ".join(parts)
+        return "  ·  ".join(parts) if parts else "Location not recorded"
 
     @staticmethod
-    def _species_name(sighting):
-        """Common name if iNaturalist has one, else the scientific name."""
-        return sighting.get("common") or sighting.get("scientific") or "Unidentified shark"
+    def _provenance(sighting):
+        """How much the position can be trusted.
+
+        Every record we plot is research grade, because the query filters on it.
+        Coordinates are deliberately randomised by iNaturalist for threatened
+        species, so saying so is more honest than implying a precise fix.
+        """
+        parts = ["Research grade"]
+        if sighting and sighting.get("obscured"):
+            parts.append("location obscured by iNaturalist")
+        else:
+            parts.append("community-verified identification")
+        return "  ·  ".join(parts)
 
     @staticmethod
     def _truncate(text, limit):
@@ -593,31 +776,19 @@ class SharkMap(BasePlugin):
     def _note_text(total_reported, lookback_days, stale_since):
         """The framing line.
 
-        This is citizen-science data: it maps where people dive and snorkel,
-        not where sharks are, and iNaturalist deliberately fuzzes coordinates
-        for threatened species. Saying "reported to iNaturalist" keeps the
-        display from overclaiming, and credits the source as their terms ask.
+        This is citizen-science data: it maps where people report sharks, not
+        where sharks are. Saying "reported" keeps the display from overclaiming.
         """
         window = "24 hours" if lookback_days == 1 else f"{lookback_days} days"
-        note = (f"Most recent of {total_reported} sightings reported to "
-                f"iNaturalist in the last {window}")
+        note = (f"Most recent of {total_reported} sightings reported "
+                f"in the last {window}")
 
         if stale_since:
             hours = int((datetime.now(timezone.utc) - stale_since).total_seconds() // 3600)
-            note += f"  ·  cached {hours}h ago, no connection" if hours >= 1 \
-                else "  ·  cached, no connection"
+            note += (f"  ·  cached {hours}h ago, no connection" if hours >= 1
+                     else "  ·  cached, no connection")
 
         return note
-
-    @staticmethod
-    def _fit_text(draw, text, font, max_width):
-        """Trim text with an ellipsis until it fits `max_width` pixels."""
-        if draw.textlength(text, font=font) <= max_width:
-            return text
-        trimmed = text
-        while trimmed and draw.textlength(trimmed + "…", font=font) > max_width:
-            trimmed = trimmed[:-1]
-        return trimmed.rstrip() + "…"
 
 
 def parse_iso(value):
